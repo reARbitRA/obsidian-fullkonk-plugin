@@ -1,0 +1,47 @@
+{
+  "name": "fullkonk-obsidian",
+  "version": "1.0.0",
+  "description": "fullKONK_> \u2014 a full-stack AI product builder inside Obsidian, orchestrating free-tier LLM providers with automatic failover.",
+  "main": "main.js",
+  "private": true,
+  "license": "MIT",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
+    "typecheck": "tsc -noEmit -skipLibCheck",
+    "typecheck:test": "tsc -p tsconfig.test.json -noEmit",
+    "lint": "eslint src --ext .ts",
+    "lint:fix": "eslint src --ext .ts --fix",
+    "test": "jest --runInBand",
+    "test:watch": "jest --watch",
+    "test:coverage": "jest --coverage --runInBand",
+    "verify": "npm run typecheck && npm run typecheck:test && npm run lint && npm run test:coverage && npm run build",
+    "package": "npm run build && node scripts/package-release.mjs"
+  },
+  "keywords": [
+    "obsidian",
+    "obsidian-plugin",
+    "ai",
+    "llm",
+    "orchestration"
+  ],
+  "author": "konkred.xyz",
+  "devDependencies": {
+    "@types/jest": "^29.5.12",
+    "@types/node": "^20.11.30",
+    "@typescript-eslint/eslint-plugin": "^7.7.0",
+    "@typescript-eslint/parser": "^7.7.0",
+    "builtin-modules": "^3.3.0",
+    "esbuild": "^0.20.2",
+    "eslint": "^8.57.0",
+    "jest": "^29.7.0",
+    "jest-environment-jsdom": "^29.7.0",
+    "obsidian": "^1.5.7-1",
+    "ts-jest": "^29.1.2",
+    "tslib": "^2.6.2",
+    "typescript": "^5.4.5"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

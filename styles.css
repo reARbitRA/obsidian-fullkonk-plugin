@@ -1,0 +1,50 @@
+/*
+  fullKONK_> global styles.
+  Obsidian automatically loads this file for the plugin (declared via manifest.json's
+  default lookup of `styles.css` next to `main.js`). Most component styling is applied
+  inline in src/view.ts to keep the single-file ItemView self-contained and trivially
+  portable between desktop and mobile; this file only contains cross-cutting rules that
+  cannot be expressed cleanly as inline styles.
+*/
+
+.fk-root * {
+  box-sizing: border-box;
+}
+
+.fk-root button {
+  transition: all 0.15s ease;
+}
+
+.fk-root textarea:focus {
+  border-color: #ffd700 !important;
+}
+
+.fk-root pre {
+  tab-size: 2;
+}
+
+.fk-root ::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+.fk-root ::-webkit-scrollbar-track {
+  background: #000;
+}
+
+.fk-root ::-webkit-scrollbar-thumb {
+  background: #1a1a1a;
+}
+
+.fk-root ::-webkit-scrollbar-thumb:hover {
+  background: #2a2a2a;
+}
+
+.fk-root button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.fk-root textarea::placeholder {
+  color: #3a3a3a;
+}

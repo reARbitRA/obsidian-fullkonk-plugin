@@ -254,7 +254,10 @@ TypeScript is configured in **strict mode** end-to-end (`strict`, `noImplicitAny
 `noImplicitReturns`, `noUnusedLocals`, `noUnusedParameters`,
 `noFallthroughCasesInSwitch`, `noImplicitOverride`, …) — `npm run verify` is the single
 command that reproduces exactly what CI runs (see
-[`.github/workflows/ci.yml`](./.github/workflows/ci.yml)).
+[`docs/ci-workflow.yml.example`](./docs/ci-workflow.yml.example) — copy it to
+`.github/workflows/ci.yml` in your own fork/clone to enable it; it ships as a
+`.example` file here because this sandbox's push credentials don't have GitHub's
+`workflows` permission scope).
 
 ## Testing
 

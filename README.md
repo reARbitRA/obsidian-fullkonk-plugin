@@ -1,0 +1,1 @@
+# obsidian-fullkonk-plugin

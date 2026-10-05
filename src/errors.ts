@@ -21,6 +21,20 @@ export class NoProvidersConfiguredError extends FullKonkError {
   }
 }
 
+/**
+ * At least one provider key is configured, but every available model is
+ * currently cooling down after a rate limit or transient failure.
+ */
+export class AllProvidersCoolingDownError extends FullKonkError {
+  constructor(public readonly retryInMs: number) {
+    const seconds = Math.max(1, Math.ceil(retryInMs / 1000));
+    super(
+      `All configured providers are currently rate limited or recovering from a recent error. ` +
+        `Try again in about ${seconds}s, or add another provider's API key in Settings.`
+    );
+  }
+}
+
 /** A provider responded with HTTP 429 (rate limited / quota exhausted). */
 export class RateLimitError extends FullKonkError {
   constructor(public readonly providerId: string, public readonly modelId: string, public readonly retryAfterMs?: number) {

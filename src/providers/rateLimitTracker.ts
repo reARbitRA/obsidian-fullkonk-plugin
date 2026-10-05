@@ -38,14 +38,19 @@ export class RateLimitTracker {
    * Record a failure for a candidate. Rate-limit failures back off more
    * aggressively (base 60s, capped at 15m) than generic errors (base 30s,
    * capped at 5m), both using exponential growth per consecutive failure.
+   * When a server supplies Retry-After, honor it if it exceeds our heuristic.
    */
-  penalize(providerId: string, modelId: string, type: PenaltyType): void {
+  penalize(providerId: string, modelId: string, type: PenaltyType, explicitDelayMs?: number): void {
     const key = this.key(providerId, modelId);
     const existing = this.penalties.get(key);
     const failures = (existing?.failures ?? 0) + 1;
     const baseMs = type === "rate" ? 60_000 : 30_000;
     const capMs = type === "rate" ? 900_000 : 300_000;
-    const delayMs = Math.min(baseMs * Math.pow(2, failures - 1), capMs);
+    const computedMs = Math.min(baseMs * Math.pow(2, failures - 1), capMs);
+    const delayMs =
+      typeof explicitDelayMs === "number" && Number.isFinite(explicitDelayMs) && explicitDelayMs > 0
+        ? Math.max(computedMs, explicitDelayMs)
+        : computedMs;
     this.penalties.set(key, { until: this.now() + delayMs, failures });
   }
 

@@ -1,7 +1,7 @@
 /**
  * @jest-environment node
  */
-import { DEFAULT_SETTINGS, sanitizeSettings } from "../types";
+import { DEFAULT_SETTINGS, sanitizeSettings, sanitizeStageRouting, TASK_TYPES } from "../types";
 
 describe("sanitizeSettings()", () => {
   it("returns DEFAULT_SETTINGS when given null/undefined/garbage", () => {
@@ -57,5 +57,65 @@ describe("sanitizeSettings()", () => {
 
   it("never throws for deeply malformed input", () => {
     expect(() => sanitizeSettings({ groqApiKey: { nested: true }, temperature: NaN })).not.toThrow();
+  });
+
+  it("preserves the API keys of every provider, including the newer additions", () => {
+    const result = sanitizeSettings({
+      mistralApiKey: "m-key",
+      togetherApiKey: "t-key",
+      fireworksApiKey: "f-key",
+    });
+    expect(result.mistralApiKey).toBe("m-key");
+    expect(result.togetherApiKey).toBe("t-key");
+    expect(result.fireworksApiKey).toBe("f-key");
+    expect(sanitizeSettings({ mistralApiKey: 42 }).mistralApiKey).toBe("");
+  });
+
+  it("defaults stage routing to fully automatic for every task", () => {
+    expect(sanitizeSettings(null).stageRouting).toEqual(DEFAULT_SETTINGS.stageRouting);
+    for (const task of TASK_TYPES) {
+      expect(DEFAULT_SETTINGS.stageRouting[task]).toEqual({ provider: "", model: "" });
+    }
+  });
+
+  it("preserves valid stage pins and trims whitespace", () => {
+    const routing = sanitizeStageRouting({
+      backend: { provider: "  deepseek  ", model: " deepseek-reasoner " },
+      frontend: { provider: "groq", model: "" },
+    });
+    expect(routing.backend).toEqual({ provider: "deepseek", model: "deepseek-reasoner" });
+    expect(routing.frontend).toEqual({ provider: "groq", model: "" });
+    expect(routing.architect).toEqual({ provider: "", model: "" });
+  });
+});
+
+describe("sanitizeStageRouting()", () => {
+  it("degrades to all-automatic for non-object input", () => {
+    expect(sanitizeStageRouting(null)).toEqual(DEFAULT_SETTINGS.stageRouting);
+    expect(sanitizeStageRouting("deepseek")).toEqual(DEFAULT_SETTINGS.stageRouting);
+    expect(sanitizeStageRouting(undefined)).toEqual(DEFAULT_SETTINGS.stageRouting);
+  });
+
+  it("ignores unknown tasks and non-object entries", () => {
+    const routing = sanitizeStageRouting({
+      backend: { provider: "groq", model: "" },
+      nonsense: { provider: "deepseek", model: "x" },
+      architect: "deepseek",
+    });
+    expect(Object.keys(routing).sort()).toEqual([...TASK_TYPES].sort());
+    expect(routing.architect).toEqual({ provider: "", model: "" });
+    expect(routing.backend).toEqual({ provider: "groq", model: "" });
+  });
+
+  it("ignores non-string provider/model values", () => {
+    const routing = sanitizeStageRouting({ verify: { provider: 7, model: { id: "x" } } });
+    expect(routing.verify).toEqual({ provider: "", model: "" });
+  });
+
+  it("returns a mutable, independent routing table", () => {
+    const first = sanitizeStageRouting(null);
+    first.review.provider = "groq";
+    expect(sanitizeStageRouting(null).review.provider).toBe("");
+    expect(DEFAULT_SETTINGS.stageRouting.review.provider).toBe("");
   });
 });

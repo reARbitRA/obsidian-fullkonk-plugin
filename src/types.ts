@@ -21,6 +21,9 @@ export type PipelineStage =
 /** Orchestration task categories used for provider scoring/routing. */
 export type TaskType = "architect" | "frontend" | "backend" | "verify" | "review";
 
+/** Every orchestration task, in pipeline order — single source of truth. */
+export const TASK_TYPES: readonly TaskType[] = ["architect", "frontend", "backend", "verify", "review"];
+
 /** Identifiers for every provider integration the plugin ships with. */
 export type ProviderID =
   | "groq"
@@ -31,7 +34,41 @@ export type ProviderID =
   | "gemini"
   | "nvidia"
   | "github"
-  | "huggingface";
+  | "huggingface"
+  | "mistral"
+  | "together"
+  | "fireworks";
+
+/**
+ * Per-stage routing override. An empty `provider` means "auto" — the
+ * orchestrator ranks every configured provider for that task as usual. A
+ * non-empty `provider` (with an optional `model`) promotes that
+ * (provider, model) pair to the head of the candidate list for that stage,
+ * without removing the automatic fallbacks behind it.
+ */
+export interface StagePin {
+  provider: string;
+  model: string;
+}
+
+/** Per-task routing overrides — one entry for every orchestration task. */
+export type StageRouting = Record<TaskType, StagePin>;
+
+/** A fresh "auto" pin (fresh object so callers can mutate safely). */
+export function autoPin(): StagePin {
+  return { provider: "", model: "" };
+}
+
+/** Fresh, fully-automatic routing table. */
+export function defaultStageRouting(): StageRouting {
+  return {
+    architect: autoPin(),
+    frontend: autoPin(),
+    backend: autoPin(),
+    verify: autoPin(),
+    review: autoPin(),
+  };
+}
 
 /** A single selectable model exposed by a provider. */
 export interface ModelDef {
@@ -66,7 +103,10 @@ export type ApiKeySettingsField =
   | "geminiApiKey"
   | "nvidiaApiKey"
   | "githubToken"
-  | "huggingfaceApiKey";
+  | "huggingfaceApiKey"
+  | "mistralApiKey"
+  | "togetherApiKey"
+  | "fireworksApiKey";
 
 /** A single chat turn rendered in the terminal panel. */
 export interface FKMessage {
@@ -95,7 +135,7 @@ export interface ChatMessage {
 export interface OrchestratorCallbacks {
   onChunk: (text: string) => void;
   onProvider: (name: string, model: string) => void;
-  onFailover: (from: string, to: string) => void;
+  onFailover: (from: string, to: string, reason?: string) => void;
   onMetrics: (tps: number, total: number) => void;
 }
 
@@ -111,12 +151,19 @@ export interface FullKonkSettings {
   nvidiaApiKey: string;
   githubToken: string;
   huggingfaceApiKey: string;
+  mistralApiKey: string;
+  togetherApiKey: string;
+  fireworksApiKey: string;
 
   // Defaults
   defaultMode: BuildMode;
   defaultProvider: string;
   temperature: number;
   maxTokens: number;
+
+  // Routing
+  /** Optional per-stage (provider, model) pin; `""` provider means automatic. */
+  stageRouting: StageRouting;
 
   // Vault
   outputFolder: string; // where to save generated files
@@ -136,10 +183,14 @@ export const DEFAULT_SETTINGS: FullKonkSettings = {
   nvidiaApiKey: "",
   githubToken: "",
   huggingfaceApiKey: "",
+  mistralApiKey: "",
+  togetherApiKey: "",
+  fireworksApiKey: "",
   defaultMode: "fullstack",
   defaultProvider: "auto",
   temperature: 0.3,
   maxTokens: 8192,
+  stageRouting: defaultStageRouting(),
   outputFolder: "fullKONK",
   saveHistory: true,
   requestTimeoutMs: 120_000,
@@ -160,6 +211,9 @@ export function sanitizeSettings(raw: unknown): FullKonkSettings {
     "nvidiaApiKey",
     "githubToken",
     "huggingfaceApiKey",
+    "mistralApiKey",
+    "togetherApiKey",
+    "fireworksApiKey",
     "defaultProvider",
     "outputFolder",
   ];
@@ -188,6 +242,8 @@ export function sanitizeSettings(raw: unknown): FullKonkSettings {
     merged.maxTokens = clamp(Math.round(input.maxTokens), 256, 65_536);
   }
 
+  merged.stageRouting = sanitizeStageRouting(input.stageRouting);
+
   if (typeof input.saveHistory === "boolean") {
     merged.saveHistory = input.saveHistory;
   }
@@ -201,6 +257,30 @@ export function sanitizeSettings(raw: unknown): FullKonkSettings {
   }
 
   return merged;
+}
+
+/**
+ * Sanitize a persisted routing table: unknown tasks are dropped, non-string
+ * provider/model values fall back to "auto", and unknown *shapes* (e.g. a
+ * string where an object is expected) degrade to the all-automatic default.
+ * Provider/model ids are validated later, at routing time, so this stays
+ * dependency-free (no import of the provider registry).
+ */
+export function sanitizeStageRouting(raw: unknown): StageRouting {
+  const result = defaultStageRouting();
+  if (!raw || typeof raw !== "object") return result;
+
+  const input = raw as Record<string, unknown>;
+  for (const task of TASK_TYPES) {
+    const value = input[task];
+    if (!value || typeof value !== "object") continue;
+    const pin = value as Partial<StagePin>;
+    result[task] = {
+      provider: typeof pin.provider === "string" ? pin.provider.trim() : "",
+      model: typeof pin.model === "string" ? pin.model.trim() : "",
+    };
+  }
+  return result;
 }
 
 function clamp(value: number, min: number, max: number): number {

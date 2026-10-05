@@ -22,8 +22,41 @@ describe("PROVIDERS registry", () => {
     }
   });
 
+  it("ships the twelve documented free-tier providers", () => {
+    expect(PROVIDERS).toHaveLength(12);
+    expect(PROVIDERS.map((p) => p.id).sort()).toEqual([
+      "cerebras",
+      "deepseek",
+      "fireworks",
+      "gemini",
+      "github",
+      "groq",
+      "huggingface",
+      "mistral",
+      "nvidia",
+      "openrouter",
+      "sambanova",
+      "together",
+    ]);
+  });
+
+  it("points every provider at an OpenAI-compatible /chat/completions base URL", () => {
+    for (const provider of PROVIDERS) {
+      expect(provider.baseUrl).not.toMatch(/\/chat\/completions/);
+      expect(provider.baseUrl.endsWith("/")).toBe(false);
+    }
+  });
+
+  it("assigns every provider a distinct API-key settings field", () => {
+    const keys = PROVIDERS.map((p) => p.settingsKey);
+    expect(new Set(keys).size).toBe(keys.length);
+  });
+
   it("getProviderById returns the matching provider", () => {
     expect(getProviderById("groq").name).toBe("Groq");
+    expect(getProviderById("mistral").name).toBe("Mistral");
+    expect(getProviderById("together").name).toBe("Together AI");
+    expect(getProviderById("fireworks").name).toBe("Fireworks AI");
   });
 
   it("getProviderById throws for an unknown id", () => {

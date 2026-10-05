@@ -76,6 +76,46 @@ describe("extractFiles", () => {
     expect(files[0].content).toContain("second, corrected version");
   });
 
+  it("preserves nested triple-backtick examples inside a four-backtick fence", () => {
+    const content = [
+      "````markdown",
+      "// docs/readme.md",
+      "# Usage example",
+      "",
+      "The README includes this fenced snippet:",
+      "```ts",
+      "const message = \"inner fences stay in the file\";",
+      "```",
+      "",
+      "The outer fence ends only after this paragraph.",
+      "````",
+    ].join("\n");
+
+    const files = extractFiles(content);
+    expect(files).toHaveLength(1);
+    expect(files[0].path).toBe("docs/readme.md");
+    expect(files[0].language).toBe("markdown");
+    expect(files[0].content).toContain("```ts\nconst message");
+    expect(files[0].content).toContain("```\n\nThe outer fence");
+  });
+
+  it("does not treat a closing fence shorter than the opener as the end", () => {
+    const content = [
+      "````ts",
+      "// src/nested.ts",
+      "const example = `markdown below is content`;",
+      "```",
+      "this line must remain inside the four-backtick block",
+      "export const finalValue = 42;",
+      "````",
+    ].join("\n");
+
+    const files = extractFiles(content);
+    expect(files).toHaveLength(1);
+    expect(files[0].content).toContain("this line must remain inside");
+    expect(files[0].content).toContain("export const finalValue");
+  });
+
   it("returns an empty array for content with no code blocks", () => {
     expect(extractFiles("just some plain prose, nothing fenced here at all")).toEqual([]);
   });

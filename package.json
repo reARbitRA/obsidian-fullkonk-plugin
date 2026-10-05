@@ -1,7 +1,7 @@
 {
   "name": "fullkonk-obsidian",
   "version": "1.0.0",
-  "description": "fullKONK_> \u2014 a full-stack AI product builder inside Obsidian, orchestrating free-tier LLM providers with automatic failover.",
+  "description": "fullKONK_> — an Obsidian AI builder and vault-native notes workspace with preview-first editing and organization tools.",
   "main": "main.js",
   "private": true,
   "license": "MIT",

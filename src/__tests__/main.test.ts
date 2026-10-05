@@ -2,14 +2,15 @@ import { App, PluginManifest, WorkspaceLeaf } from "obsidian";
 import FullKonkPlugin from "../main";
 import { DEFAULT_SETTINGS } from "../types";
 import { FK_VIEW_TYPE } from "../view";
+import { NOTES_VIEW_TYPE } from "../notesView";
 
 const TEST_MANIFEST: PluginManifest = {
   id: "fullkonk",
   name: "fullKONK_>",
   author: "konkred.xyz",
   version: "1.0.0",
-  minAppVersion: "1.4.0",
-  description: "Full-stack AI product builder inside Obsidian.",
+  minAppVersion: "1.4.4",
+  description: "AI builder and vault-native notes workspace inside Obsidian.",
 };
 
 describe("FullKonkPlugin", () => {
@@ -45,9 +46,13 @@ describe("FullKonkPlugin", () => {
     await plugin.onload();
 
     expect(registerSpy).toHaveBeenCalledWith(FK_VIEW_TYPE, expect.any(Function));
+    expect(registerSpy).toHaveBeenCalledWith(NOTES_VIEW_TYPE, expect.any(Function));
     expect(ribbonSpy).toHaveBeenCalledWith("zap", "fullKONK_>", expect.any(Function));
     expect(commandSpy).toHaveBeenCalledWith(
       expect.objectContaining({ id: "open-fullkonk", name: "Open fullKONK_>" })
+    );
+    expect(commandSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "open-vault-notes", name: "fullKONK_>: Open Vault & Notes" })
     );
     expect(settingTabSpy).toHaveBeenCalled();
   });
@@ -62,6 +67,19 @@ describe("FullKonkPlugin", () => {
     expect(revealSpy).toHaveBeenCalledTimes(1);
     const revealedLeaf = revealSpy.mock.calls[0][0] as WorkspaceLeaf;
     expect(revealedLeaf.getViewState()?.type).toBe(FK_VIEW_TYPE);
+  });
+
+  it("activateNotesView() creates and reuses a Vault & Notes leaf", async () => {
+    const plugin = makePlugin();
+    await plugin.onload();
+
+    await plugin.activateNotesView();
+    const first = plugin.app.workspace.getLeavesOfType(NOTES_VIEW_TYPE);
+    expect(first).toHaveLength(1);
+    expect(first[0].getViewState()?.type).toBe(NOTES_VIEW_TYPE);
+
+    await plugin.activateNotesView();
+    expect(plugin.app.workspace.getLeavesOfType(NOTES_VIEW_TYPE)).toHaveLength(1);
   });
 
   it("activateView() reuses an existing leaf instead of creating a new one", async () => {
@@ -81,10 +99,13 @@ describe("FullKonkPlugin", () => {
     const plugin = makePlugin();
     await plugin.onload();
     await plugin.activateView();
+    await plugin.activateNotesView();
     expect(plugin.app.workspace.getLeavesOfType(FK_VIEW_TYPE)).toHaveLength(1);
+    expect(plugin.app.workspace.getLeavesOfType(NOTES_VIEW_TYPE)).toHaveLength(1);
 
     plugin.onunload();
     expect(plugin.app.workspace.getLeavesOfType(FK_VIEW_TYPE)).toHaveLength(0);
+    expect(plugin.app.workspace.getLeavesOfType(NOTES_VIEW_TYPE)).toHaveLength(0);
   });
 
   it("saveSettings() persists the current settings object via saveData", async () => {

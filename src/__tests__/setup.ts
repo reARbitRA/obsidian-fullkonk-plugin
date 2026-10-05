@@ -117,4 +117,18 @@ if (hasDom && !navigator.clipboard) {
   });
 }
 
+// jsdom does not expose TextEncoder/TextDecoder on the global object, but the
+// ZIP exporter (src/utils/zip.ts) needs them. Real Obsidian always provides
+// both (Chromium + Node), so polyfill them from Node's `util` in tests only.
+if (typeof TextEncoder === "undefined" || typeof TextDecoder === "undefined") {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const util = require("util") as typeof import("util");
+  if (typeof TextEncoder === "undefined") {
+    Object.defineProperty(globalThis, "TextEncoder", { value: util.TextEncoder, configurable: true });
+  }
+  if (typeof TextDecoder === "undefined") {
+    Object.defineProperty(globalThis, "TextDecoder", { value: util.TextDecoder, configurable: true });
+  }
+}
+
 export {};

@@ -8,10 +8,22 @@ import { ItemView, Notice, WorkspaceLeaf } from "obsidian";
 import type FullKonkPlugin from "./main";
 import { orchestrate } from "./orchestrator";
 import { SHOWCASE_TEMPLATES, SYSTEM_PROMPTS } from "./templates";
-import { VaultManager } from "./vault";
+import { VaultManager, timestampSlug } from "./vault";
 import { extractFiles } from "./fileExtractor";
+import { buildBundleMarkdown } from "./exporter";
 import { generateId } from "./utils/uuid";
 import { AbortedError } from "./errors";
+import {
+  SessionStats,
+  StageStat,
+  createSessionStats,
+  estimateTokens,
+  formatStageLine,
+  formatSummaryLine,
+  recordStage,
+  startSession,
+  summarize,
+} from "./stats";
 import {
   BuildMode,
   ChatMessage,
@@ -19,6 +31,7 @@ import {
   GeneratedFile,
   OrchestratorCallbacks,
   PipelineStage,
+  TaskType,
 } from "./types";
 
 export const FK_VIEW_TYPE = "fullkonk-view";
@@ -47,6 +60,10 @@ export class FullKonkView extends ItemView {
   private liveTokens = 0;
   private liveTps = 0;
   private abortCtrl: AbortController | null = null;
+  private stats: SessionStats = createSessionStats();
+  private sessionTokens = 0; // tokens produced by completed stages in this build
+  private stageTokens = 0; // tokens produced by the stage currently streaming
+  private statsExpanded = false;
 
   private chatEl: HTMLElement | null = null;
   private inputEl: HTMLTextAreaElement | null = null;
@@ -54,6 +71,7 @@ export class FullKonkView extends ItemView {
   private codeBodyEl: HTMLElement | null = null;
   private stageBarEl: HTMLElement | null = null;
   private sendBtnEl: HTMLButtonElement | null = null;
+  private statsEl: HTMLElement | null = null;
 
   constructor(leaf: WorkspaceLeaf, plugin: FullKonkPlugin) {
     super(leaf);
@@ -128,6 +146,15 @@ export class FullKonkView extends ItemView {
       };
     });
 
+    const notesBtn = bar.createEl("button");
+    notesBtn.setText("☷ NOTES");
+    notesBtn.title = "Open Vault & Notes workspace";
+    notesBtn.style.cssText =
+      'padding:3px 10px;background:none;border:1px solid #222;color:#555;font-family:"JetBrains Mono",monospace;font-size:8px;font-weight:700;letter-spacing:2px;cursor:pointer;';
+    notesBtn.onclick = (): void => {
+      void this.plugin.activateNotesView();
+    };
+
     const saveBtn = bar.createEl("button");
     saveBtn.setText("↓ SAVE");
     saveBtn.style.cssText =
@@ -157,19 +184,30 @@ export class FullKonkView extends ItemView {
     const inner = this.stageBarEl.createDiv();
     inner.style.cssText = "display:flex;align-items:center;gap:10px;padding:6px 14px;flex-wrap:wrap;";
 
-    const stages: { id: PipelineStage; label: string }[] =
-      this.mode === "review"
-        ? [
-            { id: "review", label: "REVIEW" },
-            { id: "done", label: "DONE" },
-          ]
-        : [
-            { id: "architect", label: "ARCH" },
-            { id: "frontend", label: "FRONT" },
-            { id: "backend", label: "BACK" },
-            { id: "verify", label: "VERIFY" },
-            { id: "done", label: "DONE" },
-          ];
+    const stagesByMode: Record<BuildMode, { id: PipelineStage; label: string }[]> = {
+      review: [
+        { id: "review", label: "REVIEW" },
+        { id: "done", label: "DONE" },
+      ],
+      frontend: [
+        { id: "architect", label: "ARCH" },
+        { id: "frontend", label: "FRONT" },
+        { id: "done", label: "DONE" },
+      ],
+      backend: [
+        { id: "architect", label: "ARCH" },
+        { id: "backend", label: "BACK" },
+        { id: "done", label: "DONE" },
+      ],
+      fullstack: [
+        { id: "architect", label: "ARCH" },
+        { id: "frontend", label: "FRONT" },
+        { id: "backend", label: "BACK" },
+        { id: "verify", label: "VERIFY" },
+        { id: "done", label: "DONE" },
+      ],
+    };
+    const stages = stagesByMode[this.mode];
 
     const currentIdx = STAGE_ORDER.indexOf(this.stage);
     stages.forEach((s, i) => {
@@ -294,6 +332,15 @@ export class FullKonkView extends ItemView {
     this.sendBtnEl.onclick = (): void => {
       void this.send();
     };
+
+    this.statsEl = panel.createDiv({ cls: "fk-stats" });
+    this.statsEl.style.cssText =
+      'border-top:1px solid #0d0d0d;background:#040404;font-family:"JetBrains Mono",monospace;display:none;';
+    this.statsEl.onclick = (): void => {
+      this.statsExpanded = !this.statsExpanded;
+      this.renderStats();
+    };
+    this.renderStats();
   }
 
   // ─── CODE PANEL ─────────────────────────────────────────────────────────
@@ -314,6 +361,28 @@ export class FullKonkView extends ItemView {
     copyBtn.style.cssText =
       'background:none;border:none;border-right:1px solid #0d0d0d;color:#444;padding:5px 12px;font-family:"JetBrains Mono",monospace;font-size:8px;cursor:pointer;letter-spacing:1px;';
     copyBtn.onclick = (): void => this.copyActiveFile();
+
+    const copyAllBtn = actBar.createEl("button");
+    copyAllBtn.setText("⎘ COPY ALL");
+    copyAllBtn.style.cssText =
+      'background:none;border:none;border-right:1px solid #0d0d0d;color:#444;padding:5px 12px;font-family:"JetBrains Mono",monospace;font-size:8px;cursor:pointer;letter-spacing:1px;';
+    copyAllBtn.onclick = (): void => this.copyAllFiles();
+
+    const zipBtn = actBar.createEl("button");
+    zipBtn.setText("⤓ ZIP");
+    zipBtn.style.cssText =
+      'background:none;border:none;border-right:1px solid #0d0d0d;color:#444;padding:5px 12px;font-family:"JetBrains Mono",monospace;font-size:8px;cursor:pointer;letter-spacing:1px;';
+    zipBtn.onclick = (): void => {
+      void this.exportZip();
+    };
+
+    const bundleBtn = actBar.createEl("button");
+    bundleBtn.setText("≡ BUNDLE");
+    bundleBtn.style.cssText =
+      'background:none;border:none;border-right:1px solid #0d0d0d;color:#444;padding:5px 12px;font-family:"JetBrains Mono",monospace;font-size:8px;cursor:pointer;letter-spacing:1px;';
+    bundleBtn.onclick = (): void => {
+      void this.exportBundle();
+    };
 
     const saveBtn = actBar.createEl("button");
     saveBtn.setText("↓ SAVE ALL");
@@ -436,7 +505,71 @@ export class FullKonkView extends ItemView {
     pre.setText(current.content);
   }
 
+  // ─── STATS STRIP ────────────────────────────────────────────────────────
+
+  /** Render the session summary strip (click to expand the per-stage breakdown). */
+  private renderStats(): void {
+    if (!this.statsEl) return;
+    const summary = summarize(this.stats);
+    if (summary.stageCount === 0) {
+      this.statsEl.empty();
+      this.statsEl.style.display = "none";
+      return;
+    }
+
+    this.statsEl.empty();
+    this.statsEl.style.display = "block";
+
+    const line = this.statsEl.createDiv();
+    line.style.cssText = "padding:4px 10px;font-size:8px;letter-spacing:1px;color:#555;cursor:pointer;user-select:none;";
+    line.setText(`${this.statsExpanded ? "▾" : "▸"} ${formatSummaryLine(summary)}`);
+
+    if (this.statsExpanded) {
+      const detail = this.statsEl.createDiv();
+      detail.style.cssText = "padding:0 10px 6px;display:flex;flex-direction:column;gap:2px;";
+      for (const stage of this.stats.stages) {
+        const row = detail.createDiv();
+        row.style.cssText = `font-size:8px;letter-spacing:1px;color:${stage.failed ? "#FF003C" : "#3a3a3a"};`;
+        row.setText(formatStageLine(stage));
+      }
+    }
+  }
+
   // ─── PIPELINE ───────────────────────────────────────────────────────────
+
+  /**
+   * Run one orchestration stage and record its statistics (tokens streamed,
+   * wall-clock duration, provider/model actually used, success/failure) in the
+   * session stats before returning or re-throwing.
+   */
+  private async runStage(
+    task: TaskType,
+    messages: ChatMessage[],
+    stage: PipelineStage,
+    signal: AbortSignal
+  ): Promise<string> {
+    const startedAt = Date.now();
+    let failed = false;
+    try {
+      return await orchestrate(task, messages, this.plugin.settings, this.buildCallbacks(), signal);
+    } catch (err) {
+      failed = true;
+      throw err;
+    } finally {
+      const stat: StageStat = {
+        stage,
+        provider: this.liveProvider,
+        model: this.liveModel,
+        tokens: this.stageTokens,
+        durationMs: Date.now() - startedAt,
+        failed,
+      };
+      this.sessionTokens += this.stageTokens;
+      this.stageTokens = 0;
+      recordStage(this.stats, stat);
+      this.renderStats();
+    }
+  }
 
   private buildCallbacks(): OrchestratorCallbacks {
     return {
@@ -444,21 +577,37 @@ export class FullKonkView extends ItemView {
         const last = this.messages[this.messages.length - 1];
         if (last?.role !== "assistant") return;
         last.content += text;
+        this.stageTokens += estimateTokens(text);
         this.appendChunkToLastMsg();
         this.refreshExtractedFiles();
       },
       onProvider: (provider: string, model: string): void => {
         this.liveProvider = provider;
         this.liveModel = model;
+        this.liveTokens = this.stageTokens;
         this.renderStageBar();
       },
-      onFailover: (from: string, to: string): void => {
-        new Notice(`fullKONK_>: ${from} rate limited → switching to ${to}`, 3000);
+      onFailover: (from: string, to: string, reason = "provider failed"): void => {
+        const shortReason = reason.length > 140 ? `${reason.slice(0, 140)}…` : reason;
+        new Notice(`fullKONK_>: ${from} failed (${shortReason}) → switching to ${to}`, 3000);
+        // Discard streamed partial output from the failed provider so the next
+        // completion starts cleanly rather than being concatenated onto it.
+        const last = this.messages[this.messages.length - 1];
+        if (last?.role === "assistant" && last.content) {
+          last.content = "";
+          this.appendChunkToLastMsg();
+          this.refreshExtractedFiles();
+        }
         this.renderStageBar();
       },
       onMetrics: (tps: number, total: number): void => {
         this.liveTps = tps;
-        this.liveTokens = total;
+        // `total` is the *current stage's* running token count as reported by
+        // the orchestrator; keep whichever estimate is larger so chunk counting
+        // and provider-reported accounting never regress or double-count. The
+        // strip below the input shows the session-wide totals instead.
+        this.stageTokens = Math.max(this.stageTokens, total);
+        this.liveTokens = this.stageTokens;
         this.renderStageBar();
       },
     };
@@ -476,7 +625,9 @@ export class FullKonkView extends ItemView {
     if (!changed) return;
 
     this.files = extracted;
-    if (!this.activeFile && extracted[0]) this.activeFile = extracted[0].path;
+    if (!this.activeFile || !extracted.some((file) => file.path === this.activeFile)) {
+      this.activeFile = extracted[0]?.path ?? null;
+    }
     this.renderFileTabs();
     this.renderCodeBody();
   }
@@ -517,6 +668,10 @@ export class FullKonkView extends ItemView {
     this.activeFile = null;
     this.liveTokens = 0;
     this.liveTps = 0;
+    this.sessionTokens = 0;
+    this.stageTokens = 0;
+    startSession(this.stats);
+    this.renderStats();
     this.renderCodeBody();
 
     this.abortCtrl = new AbortController();
@@ -526,20 +681,17 @@ export class FullKonkView extends ItemView {
     this.messages.push(userMsg);
     this.appendMessage(userMsg);
 
-    const callbacks = this.buildCallbacks();
-
     try {
       if (this.mode === "review") {
         this.setStage("review");
         this.addAssistantMessage("review");
-        await orchestrate(
+        await this.runStage(
           "review",
           asMessages([
             { role: "system", content: SYSTEM_PROMPTS.verify },
             { role: "user", content: prompt },
           ]),
-          this.plugin.settings,
-          callbacks,
+          "review",
           signal
         );
         this.setStage("done");
@@ -547,14 +699,13 @@ export class FullKonkView extends ItemView {
         this.setStage("architect");
         this.addAssistantMessage("architect");
         const archMsg = this.messages[this.messages.length - 1];
-        await orchestrate(
+        await this.runStage(
           "architect",
           asMessages([
             { role: "system", content: SYSTEM_PROMPTS.architect },
             { role: "user", content: `Design architecture for: ${prompt}` },
           ]),
-          this.plugin.settings,
-          callbacks,
+          "architect",
           signal
         );
         const architecture = archMsg.content;
@@ -566,14 +717,13 @@ export class FullKonkView extends ItemView {
           this.setStage("frontend");
           this.addAssistantMessage("frontend");
           const feMsg = this.messages[this.messages.length - 1];
-          await orchestrate(
+          await this.runStage(
             "frontend",
             asMessages([
               { role: "system", content: SYSTEM_PROMPTS.frontend },
               { role: "user", content: `Architecture:\n${architecture}\n\nBuild complete frontend.` },
             ]),
-            this.plugin.settings,
-            callbacks,
+            "frontend",
             signal
           );
           frontend = feMsg.content;
@@ -583,14 +733,13 @@ export class FullKonkView extends ItemView {
           this.setStage("backend");
           this.addAssistantMessage("backend");
           const beMsg = this.messages[this.messages.length - 1];
-          await orchestrate(
+          await this.runStage(
             "backend",
             asMessages([
               { role: "system", content: SYSTEM_PROMPTS.backend },
               { role: "user", content: `Architecture:\n${architecture}\n\nFrontend built. Build complete backend.` },
             ]),
-            this.plugin.settings,
-            callbacks,
+            "backend",
             signal
           );
           const backend = beMsg.content;
@@ -598,7 +747,7 @@ export class FullKonkView extends ItemView {
           if (!signal.aborted) {
             this.setStage("verify");
             this.addAssistantMessage("verify");
-            await orchestrate(
+            await this.runStage(
               "verify",
               asMessages([
                 { role: "system", content: SYSTEM_PROMPTS.verify },
@@ -607,22 +756,20 @@ export class FullKonkView extends ItemView {
                   content: `Architecture:\n${architecture}\n\nFrontend:\n${frontend}\n\nBackend:\n${backend}\n\nVerify and fix integration.`,
                 },
               ]),
-              this.plugin.settings,
-              callbacks,
+              "verify",
               signal
             );
           }
         } else if (this.mode === "backend") {
           this.setStage("backend");
           this.addAssistantMessage("backend");
-          await orchestrate(
+          await this.runStage(
             "backend",
             asMessages([
               { role: "system", content: SYSTEM_PROMPTS.backend },
               { role: "user", content: `Architecture:\n${architecture}\n\nBuild complete backend.` },
             ]),
-            this.plugin.settings,
-            callbacks,
+            "backend",
             signal
           );
         }
@@ -632,7 +779,7 @@ export class FullKonkView extends ItemView {
 
       if (this.plugin.settings.saveHistory && this.messages.length > 0) {
         await this.vault
-          .saveChatHistory(prompt.slice(0, 40), this.messages, this.mode, this.liveProvider)
+          .saveChatHistory(prompt.slice(0, 40), this.messages, this.mode, this.liveProvider, this.stats)
           .catch(() => {
             /* best-effort persistence; surfaced failures would be noisy on every send */
           });
@@ -680,10 +827,15 @@ export class FullKonkView extends ItemView {
     this.liveModel = "";
     this.liveTokens = 0;
     this.liveTps = 0;
+    this.sessionTokens = 0;
+    this.stageTokens = 0;
+    this.statsExpanded = false;
+    this.stats = createSessionStats();
     this.renderEmpty();
     this.renderFileTabs();
     this.renderCodeBody();
     this.renderStageBar();
+    this.renderStats();
   }
 
   private copyActiveFile(): void {
@@ -697,14 +849,63 @@ export class FullKonkView extends ItemView {
       });
   }
 
+  /** Copy every generated file as one Markdown bundle (same format as `exportBundle`). */
+  private copyAllFiles(): void {
+    if (this.files.length === 0) {
+      new Notice("No files to copy yet.");
+      return;
+    }
+    const markdown = buildBundleMarkdown(this.currentProjectName(), this.files, timestampSlug());
+    navigator.clipboard
+      .writeText(markdown)
+      .then(() => new Notice(`Copied ${this.files.length} files to clipboard`))
+      .catch(() => {
+        /* clipboard permission denied — silently ignore, non-critical UX affordance */
+      });
+  }
+
+  /** Export every generated file as a single Markdown bundle note in the vault. */
+  async exportBundle(): Promise<void> {
+    if (this.files.length === 0) {
+      new Notice("No files to export yet.");
+      return;
+    }
+    try {
+      const path = await this.vault.saveBundle(this.currentProjectName(), this.files);
+      new Notice(`Exported bundle → ${path}`);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      new Notice(`Export failed: ${message}`);
+    }
+  }
+
+  /** Export every generated file as a `.zip` archive written into the vault. */
+  async exportZip(): Promise<void> {
+    if (this.files.length === 0) {
+      new Notice("No files to export yet.");
+      return;
+    }
+    try {
+      const path = await this.vault.exportZip(this.currentProjectName(), this.files);
+      new Notice(`Exported ZIP → ${path}`);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      new Notice(`Export failed: ${message}`);
+    }
+  }
+
+  /** Project name derived from the first user prompt (mirrors history/bundle naming). */
+  private currentProjectName(): string {
+    return (this.messages.find((m) => m.role === "user")?.content ?? "fullkonk-output").slice(0, 40);
+  }
+
   async saveToVault(): Promise<void> {
     if (this.files.length === 0) {
       new Notice("No files to save yet.");
       return;
     }
-    const prompt = this.messages.find((m) => m.role === "user")?.content ?? "fullkonk-output";
     try {
-      const folder = await this.vault.saveGeneratedFiles(prompt.slice(0, 40), this.files);
+      const folder = await this.vault.saveGeneratedFiles(this.currentProjectName(), this.files);
       new Notice(`Saved ${this.files.length} files to ${folder}`);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -730,6 +931,14 @@ export class FullKonkView extends ItemView {
 
   isStreaming(): boolean {
     return this.streaming;
+  }
+
+  getStageStatsSnapshot(): readonly StageStat[] {
+    return this.stats.stages;
+  }
+
+  getStatsLine(): string {
+    return formatSummaryLine(summarize(this.stats));
   }
 }
 

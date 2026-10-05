@@ -2,6 +2,7 @@
  * @jest-environment node
  */
 import {
+  AllProvidersCoolingDownError,
   AllProvidersFailedError,
   EmptyCompletionError,
   FullKonkError,
@@ -24,6 +25,14 @@ describe("error hierarchy", () => {
       expect(err).toBeInstanceOf(FullKonkError);
       expect(err.name).toBe(err.constructor.name);
     }
+  });
+
+  it("distinguishes configured providers cooling down from missing API keys", () => {
+    const err = new AllProvidersCoolingDownError(12_100);
+    expect(err).toBeInstanceOf(FullKonkError);
+    expect(err.retryInMs).toBe(12_100);
+    expect(err.message).toContain("about 13s");
+    expect(err.message).not.toContain("No API keys configured");
   });
 
   it("RateLimitError carries provider/model/retryAfter metadata", () => {

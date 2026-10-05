@@ -2,6 +2,7 @@
  * @jest-environment node
  */
 import {
+  applyStagePin,
   buildCandidates,
   orchestrate,
   score,
@@ -10,6 +11,7 @@ import {
 } from "../orchestrator";
 import { RateLimitTracker } from "../providers/rateLimitTracker";
 import {
+  AllProvidersCoolingDownError,
   AllProvidersFailedError,
   NoProvidersConfiguredError,
   ProviderRequestError,
@@ -40,10 +42,14 @@ function sseChunk(contentPieces: string[]): string {
 }
 
 function makeStreamResponse(body: string, status = 200): Response {
+  return makeFragmentedStreamResponse([body], status);
+}
+
+function makeFragmentedStreamResponse(chunks: string[], status = 200): Response {
   const encoder = new TextEncoder();
   const stream = new ReadableStream<Uint8Array>({
     start(controller) {
-      controller.enqueue(encoder.encode(body));
+      for (const chunk of chunks) controller.enqueue(encoder.encode(chunk));
       controller.close();
     },
   });
@@ -133,20 +139,107 @@ describe("buildCandidates()", () => {
   });
 
   it("covers every real registered provider when all keys are present", () => {
-    const allKeysSettings = settingsWith({
-      groqApiKey: "a",
-      deepseekApiKey: "a",
-      cerebrasApiKey: "a",
-      sambanovaApiKey: "a",
-      openrouterApiKey: "a",
-      geminiApiKey: "a",
-      nvidiaApiKey: "a",
-      githubToken: "a",
-      huggingfaceApiKey: "a",
-    });
+    // Derive the keys from the registry so adding a provider can never silently
+    // drop out of this coverage check.
+    const allKeysSettings = settingsWith(
+      Object.fromEntries(PROVIDERS.map((p) => [p.settingsKey, "a"])) as Partial<FullKonkSettings>
+    );
     const candidates = buildCandidates(allKeysSettings, "architect");
     const totalModels = PROVIDERS.reduce((sum, p) => sum + p.models.length, 0);
     expect(candidates).toHaveLength(totalModels);
+  });
+});
+
+describe("per-stage routing pins", () => {
+  const bothKeys = (): FullKonkSettings => settingsWith({ groqApiKey: "a", deepseekApiKey: "b" });
+  const twoProviders = [FAKE_PROVIDER_A, FAKE_PROVIDER_B];
+
+  function pinned(settings: FullKonkSettings, task: Parameters<typeof applyStagePin>[2], provider: string, model = "") {
+    const withPin: FullKonkSettings = {
+      ...settings,
+      stageRouting: { ...settings.stageRouting, [task]: { provider, model } },
+    };
+    return buildCandidates(withPin, task, new RateLimitTracker(), twoProviders);
+  }
+
+  it("promotes a pinned provider above the automatic winner", () => {
+    // Without a pin, groq (priority 1) leads; the pin must flip that.
+    const baseline = buildCandidates(bothKeys(), "backend", new RateLimitTracker(), twoProviders);
+    expect(baseline[0].provider.id).toBe("groq");
+
+    const candidates = pinned(bothKeys(), "backend", "deepseek");
+    expect(candidates[0].provider.id).toBe("deepseek");
+    expect(candidates[0].model.id).toBe("model-b");
+  });
+
+  it("keeps the automatic fallbacks behind the pinned provider", () => {
+    const candidates = pinned(bothKeys(), "backend", "deepseek");
+    expect(candidates.map((c) => c.provider.id)).toEqual(["deepseek", "groq"]);
+  });
+
+  it("selects the exact pinned model when specified", () => {
+    const multiModel: ProviderDef = {
+      ...FAKE_PROVIDER_B,
+      models: [
+        { id: "model-b", label: "Model B" },
+        { id: "model-b-2", label: "Model B2" },
+      ],
+    };
+    const settings: FullKonkSettings = {
+      ...bothKeys(),
+      stageRouting: { ...bothKeys().stageRouting, verify: { provider: "deepseek", model: "model-b-2" } },
+    };
+    const candidates = buildCandidates(settings, "verify", new RateLimitTracker(), [FAKE_PROVIDER_A, multiModel]);
+
+    expect(candidates[0].model.id).toBe("model-b-2");
+  });
+
+  it("falls back to another model of the pinned provider when the exact one is cooling down", () => {
+    const multiModel: ProviderDef = {
+      ...FAKE_PROVIDER_B,
+      models: [
+        { id: "model-b", label: "Model B" },
+        { id: "model-b-2", label: "Model B2" },
+      ],
+    };
+    const tracker = new RateLimitTracker();
+    tracker.penalize("deepseek", "model-b-2", "rate");
+
+    const settings: FullKonkSettings = {
+      ...bothKeys(),
+      stageRouting: { ...bothKeys().stageRouting, verify: { provider: "deepseek", model: "model-b-2" } },
+    };
+    const candidates = buildCandidates(settings, "verify", tracker, [FAKE_PROVIDER_A, multiModel]);
+
+    expect(candidates[0].provider.id).toBe("deepseek");
+    expect(candidates[0].model.id).toBe("model-b");
+  });
+
+  it("ignores a pin for a provider whose key is not configured", () => {
+    const settings: FullKonkSettings = {
+      ...settingsWith({ groqApiKey: "a" }),
+      stageRouting: { ...DEFAULT_SETTINGS.stageRouting, backend: { provider: "deepseek", model: "" } },
+    };
+    const candidates = buildCandidates(settings, "backend", new RateLimitTracker(), twoProviders);
+
+    expect(candidates.map((c) => c.provider.id)).toEqual(["groq"]);
+  });
+
+  it("ignores an unknown provider id", () => {
+    const candidates = pinned(bothKeys(), "backend", "not-a-provider");
+    expect(candidates[0].provider.id).toBe("groq");
+  });
+
+  it("is scoped to a single stage", () => {
+    const settings: FullKonkSettings = {
+      ...bothKeys(),
+      stageRouting: { ...bothKeys().stageRouting, architect: { provider: "deepseek", model: "" } },
+    };
+    const architect = buildCandidates(settings, "architect", new RateLimitTracker(), twoProviders);
+    const backend = buildCandidates(settings, "backend", new RateLimitTracker(), twoProviders);
+
+    expect(architect[0].provider.id).toBe("deepseek");
+    expect(backend[0].provider.id).toBe("groq");
   });
 });
 
@@ -179,10 +272,62 @@ describe("streamCandidate()", () => {
     const [, init] = fetchImpl.mock.calls[0] as [string, RequestInit];
     expect(init.method).toBe("POST");
     expect((init.headers as Record<string, string>)["Authorization"]).toBe("Bearer sk-test");
+    expect((init.headers as Record<string, string>)["HTTP-Referer"]).toBeUndefined();
+    expect((init.headers as Record<string, string>)["X-Title"]).toBeUndefined();
     const body = JSON.parse(init.body as string);
     expect(body.model).toBe("model-a");
     expect(body.max_tokens).toBe(100); // min(maxTokens, provider.maxOutput)
     expect(body.stream).toBe(true);
+  });
+
+  it("adds attribution headers only for OpenRouter requests", async () => {
+    const openRouter: ProviderDef = {
+      ...FAKE_PROVIDER_A,
+      id: "openrouter",
+      name: "OpenRouter",
+      settingsKey: "openrouterApiKey",
+    };
+    const fetchImpl = jest.fn().mockResolvedValue(makeStreamResponse(sseChunk(["OpenRouter response"] )));
+
+    await streamCandidate(
+      { provider: openRouter, model: openRouter.models[0], score: 5 },
+      [{ role: "user", content: "hi" }],
+      0.5,
+      100,
+      "sk-test",
+      { onChunk: jest.fn(), onMetrics: jest.fn() },
+      new RateLimitTracker(),
+      fetchImpl
+    );
+
+    const [, init] = fetchImpl.mock.calls[0] as [string, RequestInit];
+    const headers = init.headers as Record<string, string>;
+    expect(headers["HTTP-Referer"]).toBe("https://konkred.xyz");
+    expect(headers["X-Title"]).toBe("fullKONK_> Obsidian Plugin");
+  });
+
+  it("reassembles SSE lines split across network chunks", async () => {
+    const payload = sseChunk(["streamed content survives partial JSON chunks"]);
+    const splitAt = payload.indexOf("survives") + 4;
+    const fetchImpl = jest
+      .fn()
+      .mockResolvedValue(makeFragmentedStreamResponse([payload.slice(0, splitAt), payload.slice(splitAt)]));
+    const onChunk = jest.fn();
+    const candidate = { provider: FAKE_PROVIDER_A, model: FAKE_PROVIDER_A.models[0], score: 5 };
+
+    const result = await streamCandidate(
+      candidate,
+      [{ role: "user", content: "hi" }],
+      0.5,
+      100,
+      "sk-test",
+      { onChunk, onMetrics: jest.fn() },
+      new RateLimitTracker(),
+      fetchImpl
+    );
+
+    expect(result).toBe("streamed content survives partial JSON chunks");
+    expect(onChunk).toHaveBeenCalledTimes(1);
   });
 
   it("caps max_tokens at the provider's maxOutput", async () => {
@@ -207,25 +352,26 @@ describe("streamCandidate()", () => {
 
   it("throws RateLimitError and penalizes the tracker on HTTP 429", async () => {
     const fetchImpl = jest.fn().mockResolvedValue(
-      new Response("rate limited", { status: 429, headers: { "retry-after": "12" } })
+      new Response("rate limited", { status: 429, headers: { "retry-after": "120" } })
     );
-    const tracker = new RateLimitTracker();
+    const tracker = new RateLimitTracker(() => 1_000);
     const candidate = { provider: FAKE_PROVIDER_A, model: FAKE_PROVIDER_A.models[0], score: 5 };
 
-    await expect(
-      streamCandidate(
-        candidate,
-        [{ role: "user", content: "hi" }],
-        0.5,
-        100,
-        "sk-test",
-        { onChunk: jest.fn(), onMetrics: jest.fn() },
-        tracker,
-        fetchImpl
-      )
-    ).rejects.toBeInstanceOf(RateLimitError);
+    const error = await streamCandidate(
+      candidate,
+      [{ role: "user", content: "hi" }],
+      0.5,
+      100,
+      "sk-test",
+      { onChunk: jest.fn(), onMetrics: jest.fn() },
+      tracker,
+      fetchImpl
+    ).catch((caught: unknown) => caught);
 
+    expect(error).toBeInstanceOf(RateLimitError);
+    expect(error).toMatchObject({ retryAfterMs: 120_000 });
     expect(tracker.isAvailable("groq", "model-a")).toBe(false);
+    expect(tracker.cooldownRemainingMs("groq", "model-a")).toBe(120_000);
   });
 
   it("throws ProviderRequestError and penalizes the tracker on other non-2xx statuses", async () => {
@@ -257,6 +403,25 @@ describe("orchestrate()", () => {
     ).rejects.toBeInstanceOf(NoProvidersConfiguredError);
   });
 
+  it("reports a cooldown error when configured providers are temporarily unavailable", async () => {
+    const settings = settingsWith({ groqApiKey: "a", deepseekApiKey: "b" });
+    const tracker = new RateLimitTracker(() => 1_000);
+    tracker.penalize("groq", "model-a", "rate");
+    tracker.penalize("deepseek", "model-b", "rate");
+
+    const error = await orchestrate(
+      "backend",
+      [{ role: "user", content: "hi" }],
+      settings,
+      noopCallbacks(),
+      undefined,
+      { tracker, fetchImpl: jest.fn(), providers: [FAKE_PROVIDER_A, FAKE_PROVIDER_B] }
+    ).catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(AllProvidersCoolingDownError);
+    expect(error).toMatchObject({ retryInMs: 60_000 });
+  });
+
   it("throws for an empty messages array", async () => {
     await expect(
       orchestrate("architect", [], settingsWith({ groqApiKey: "a" }), noopCallbacks())
@@ -284,6 +449,11 @@ describe("orchestrate()", () => {
 
     expect(result).toBe("final answer");
     expect(callbacks.onFailover).toHaveBeenCalledTimes(1);
+    expect(callbacks.onFailover).toHaveBeenCalledWith(
+      "Fake A / Model A",
+      "Fake B / Model B",
+      "Rate limited by groq/model-a"
+    );
     expect(tracker.isAvailable("groq", "model-a")).toBe(false);
     expect(tracker.isAvailable("deepseek", "model-b")).toBe(true);
   });

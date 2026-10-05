@@ -84,6 +84,23 @@ describe("FullKonkView", () => {
     expect(view.isStreaming()).toBe(false);
   });
 
+  it("shows only the stages that run for frontend-only and backend-only builds", async () => {
+    for (const mode of ["frontend", "backend"] as const) {
+      orchestrateMock.mockResolvedValue("ok");
+      const view = await openView({ defaultMode: mode });
+      getInput(view).value = `Build a ${mode} project`;
+      await view.send();
+
+      const stageBar = view.containerEl.querySelector(".fk-stagebar");
+      expect(stageBar?.textContent).toContain("ARCH");
+      expect(stageBar?.textContent).toContain(mode === "frontend" ? "FRONT" : "BACK");
+      expect(stageBar?.textContent).toContain("DONE");
+      expect(stageBar?.textContent).not.toContain(mode === "frontend" ? "VERIFY" : "FRONT");
+      if (mode === "frontend") expect(stageBar?.textContent).not.toContain("BACK");
+      else expect(stageBar?.textContent).not.toContain("VERIFY");
+    }
+  });
+
   it("runs only the architect stage for review mode, using the verify system prompt", async () => {
     orchestrateMock.mockResolvedValue("Looks good, no issues found.");
     const view = await openView({ defaultMode: "review" });
@@ -395,6 +412,27 @@ describe("FullKonkView", () => {
     expect(view.containerEl.textContent).toContain("1,337 tokens");
   });
 
+  it("clears a failed provider's partial output before rendering the failover response", async () => {
+    orchestrateMock.mockImplementation(async (task, _messages, _settings, callbacks) => {
+      if (task === "backend") {
+        callbacks.onChunk("```ts\n// src/result.ts\nexport const result = 'partial output that must be discarded';\n```");
+        callbacks.onFailover("Provider A / Model A", "Provider B / Model B", "temporary provider error");
+        callbacks.onChunk("```ts\n// src/result.ts\nexport const result = 'complete response after switching providers';\n```");
+      }
+      return "ok";
+    });
+    const view = await openView({ defaultMode: "backend" });
+    getInput(view).value = "Build a backend";
+    await view.send();
+
+    const backendMessage = view.getMessagesSnapshot().filter((message) => message.stage === "backend")[0];
+    expect(backendMessage?.content).not.toContain("partial output");
+    expect(backendMessage?.content).toContain("complete response after switching providers");
+    expect(view.getFilesSnapshot()).toHaveLength(1);
+    expect(view.getFilesSnapshot()[0].content).toContain("complete response");
+    expect(view.getFilesSnapshot()[0].content).not.toContain("partial output");
+  });
+
   it("disables mode switching while a build is in progress", async () => {
     orchestrateMock.mockImplementation(
       () =>
@@ -412,5 +450,222 @@ describe("FullKonkView", () => {
 
     view.stop();
     await sendPromise;
+  });
+
+  // ─── Session stats ─────────────────────────────────────────────────────
+
+  describe("session stats strip", () => {
+    function strip(view: FullKonkView): HTMLElement {
+      const el = view.containerEl.querySelector(".fk-stats");
+      if (!el) throw new Error("stats strip not found");
+      return el as HTMLElement;
+    }
+
+    function streamingStage(chars = 400): void {
+      orchestrateMock.mockImplementation(async (_task, _messages, _settings, callbacks) => {
+        callbacks.onProvider("Groq", "Llama 3.3 70B");
+        callbacks.onChunk("x".repeat(chars));
+        return "x".repeat(chars);
+      });
+    }
+
+    it("is hidden until a build has recorded at least one stage", async () => {
+      const view = await openView();
+      expect(strip(view).style.display).toBe("none");
+      expect(view.getStageStatsSnapshot()).toHaveLength(0);
+    });
+
+    it("records provider, model, tokens and duration for every stage", async () => {
+      streamingStage();
+      const view = await openView({ defaultMode: "backend" });
+      getInput(view).value = "Build a backend";
+      await view.send();
+
+      const stats = view.getStageStatsSnapshot();
+      expect(stats.map((s) => s.stage)).toEqual(["architect", "backend"]);
+      expect(stats[0]).toMatchObject({
+        provider: "Groq",
+        model: "Llama 3.3 70B",
+        tokens: 100, // 400 chars ≈ 100 tokens
+        failed: false,
+      });
+      expect(stats[0].durationMs).toBeGreaterThanOrEqual(0);
+    });
+
+    it("shows a summary line and expands to a per-stage breakdown on click", async () => {
+      streamingStage();
+      const view = await openView({ defaultMode: "backend" });
+      getInput(view).value = "Build a backend";
+      await view.send();
+
+      expect(strip(view).style.display).toBe("block");
+      expect(strip(view).textContent).toContain("Σ 200 tok");
+      expect(strip(view).textContent).toContain("2 stages");
+      expect(view.getStatsLine()).toContain("Σ 200 tok");
+
+      strip(view).click();
+      expect(strip(view).textContent).toContain("ARCHITECT — 100 tok");
+      expect(strip(view).textContent).toContain("BACKEND — 100 tok");
+      expect(strip(view).textContent).toContain("Groq / Llama 3.3 70B");
+
+      strip(view).click();
+      expect(strip(view).textContent).not.toContain("ARCHITECT —");
+    });
+
+    it("marks stages as failed when orchestrate rejects", async () => {
+      orchestrateMock.mockRejectedValue(new Error("boom"));
+      const view = await openView({ defaultMode: "backend" });
+      getInput(view).value = "Build something";
+      await view.send();
+
+      const stats = view.getStageStatsSnapshot();
+      expect(stats).toHaveLength(1);
+      expect(stats[0].failed).toBe(true);
+      expect(strip(view).textContent).toContain("1 failed");
+    });
+
+    it("resets the stats when clear() is called", async () => {
+      streamingStage();
+      const view = await openView({ defaultMode: "backend" });
+      getInput(view).value = "Build a backend";
+      await view.send();
+      strip(view).click();
+
+      view.clear();
+
+      expect(view.getStageStatsSnapshot()).toHaveLength(0);
+      expect(strip(view).style.display).toBe("none");
+      expect(view.getStatsLine()).toBe("Σ no stages yet");
+    });
+
+    it("keeps the live stage-bar count per stage while the strip stays session-wide", async () => {
+      orchestrateMock.mockImplementation(async (_task, _messages, _settings, callbacks) => {
+        callbacks.onProvider("Groq", "Llama 3.3 70B");
+        callbacks.onMetrics(25, 1000);
+        return "ok";
+      });
+      const view = await openView({ defaultMode: "backend" });
+      getInput(view).value = "Build a backend";
+      await view.send();
+
+      // Stage bar: 1,000 tokens (last stage). Strip: 2,000 tokens total.
+      expect(view.containerEl.textContent).toContain("1,000 tokens");
+      expect(view.getStatsLine()).toContain("Σ 2,000 tok");
+    });
+  });
+
+  // ─── Exports ───────────────────────────────────────────────────────────
+
+  describe("export actions", () => {
+    async function openViewWithApp(
+      overrides: Partial<typeof DEFAULT_SETTINGS> = {}
+    ): Promise<{ view: FullKonkView; app: App }> {
+      const { app, plugin } = makePlugin(overrides);
+      const view = new FullKonkView(new WorkspaceLeaf(), plugin);
+      await view.onOpen();
+      return { view, app };
+    }
+
+    function withFiles(): void {
+      orchestrateMock.mockImplementation(async (_task, _messages, _settings, callbacks) => {
+        callbacks.onChunk("```ts\n// a.ts\nexport const a = 1234567890; // padding to exceed min length\n```");
+        return "ok";
+      });
+    }
+
+    function buttonByText(view: FullKonkView, text: string): HTMLButtonElement {
+      const btn = Array.from(view.containerEl.querySelectorAll("button")).find((b) => b.textContent === text);
+      if (!btn) throw new Error(`button "${text}" not found`);
+      return btn as HTMLButtonElement;
+    }
+
+    it("COPY ALL copies every file as one markdown bundle", async () => {
+      withFiles();
+      const view = await openView({ defaultMode: "backend" });
+      getInput(view).value = "Build a backend";
+      await view.send();
+      (navigator.clipboard.writeText as jest.Mock).mockClear();
+      (Notice as jest.Mock).mockClear();
+
+      buttonByText(view, "⎘ COPY ALL").click();
+      await flushMicrotasks();
+
+      const copied = (navigator.clipboard.writeText as jest.Mock).mock.calls[0][0] as string;
+      expect(copied).toContain("## `a.ts`");
+      expect(copied).toContain("```ts\nexport const a = 1234567890;");
+      expect(copied).toContain("files: 1");
+      expect(Notice).toHaveBeenCalledWith("Copied 1 files to clipboard");
+    });
+
+    it("ZIP writes a valid archive into the vault and reports the path", async () => {
+      withFiles();
+      const { view, app } = await openViewWithApp({ defaultMode: "backend" });
+      getInput(view).value = "Build a backend";
+      await view.send();
+      (Notice as jest.Mock).mockClear();
+
+      buttonByText(view, "⤓ ZIP").click();
+      await flushMicrotasks();
+      await flushMicrotasks();
+
+      const notice = (Notice as jest.Mock).mock.calls.map((c) => c[0] as string).join("\n");
+      expect(notice).toContain("Exported ZIP → fullKONK/exports/");
+
+      const exported = [...(app.vault as unknown as { nodes: Map<string, unknown> }).nodes.keys()];
+      expect(exported.some((p) => String(p).endsWith(".zip"))).toBe(true);
+
+      const zipPath = exported.find((p) => String(p).endsWith(".zip")) as string;
+      const file = app.vault.getAbstractFileByPath(zipPath);
+      const bytes = new Uint8Array(await app.vault.readBinary(file as never));
+      expect(new DataView(bytes.buffer).getUint32(0, true)).toBe(0x04034b50);
+    });
+
+    it("BUNDLE writes a single markdown file into the vault", async () => {
+      withFiles();
+      const { view, app } = await openViewWithApp({ defaultMode: "backend" });
+      getInput(view).value = "Build a backend";
+      await view.send();
+      (Notice as jest.Mock).mockClear();
+
+      buttonByText(view, "≡ BUNDLE").click();
+      await flushMicrotasks();
+      await flushMicrotasks();
+
+      const notice = (Notice as jest.Mock).mock.calls.map((c) => c[0] as string).join("\n");
+      expect(notice).toContain("Exported bundle → fullKONK/exports/");
+      expect(notice).toContain(".md");
+
+      const path = notice.split("→ ")[1].trim();
+      const file = app.vault.getAbstractFileByPath(path);
+      expect(file).not.toBeNull();
+      expect(await app.vault.read(file as never)).toContain("## `a.ts`");
+    });
+
+    it("notifies instead of exporting when there are no generated files", async () => {
+      const view = await openView();
+      (Notice as jest.Mock).mockClear();
+
+      buttonByText(view, "⎘ COPY ALL").click();
+      await view.exportZip();
+      await view.exportBundle();
+
+      expect(Notice).toHaveBeenCalledWith("No files to copy yet.");
+      expect(Notice).toHaveBeenCalledWith("No files to export yet.");
+      expect(navigator.clipboard.writeText).not.toHaveBeenCalled();
+    });
+
+    it("surfaces export failures as a Notice", async () => {
+      withFiles();
+      const { view } = await openViewWithApp({ defaultMode: "backend" });
+      getInput(view).value = "Build a backend";
+      await view.send();
+      const vault = (view as unknown as { vault: { exportZip: unknown } }).vault;
+      vault.exportZip = jest.fn().mockRejectedValue(new Error("disk full"));
+      (Notice as jest.Mock).mockClear();
+
+      await view.exportZip();
+
+      expect(Notice).toHaveBeenCalledWith("Export failed: disk full");
+    });
   });
 });

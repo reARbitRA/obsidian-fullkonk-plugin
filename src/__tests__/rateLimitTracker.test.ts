@@ -46,6 +46,18 @@ describe("RateLimitTracker", () => {
     expect(tracker.cooldownRemainingMs("groq", "m")).toBe(900_000);
   });
 
+  it("honors an explicit server Retry-After delay when it exceeds the backoff", () => {
+    const tracker = new RateLimitTracker(() => 1_000);
+    tracker.penalize("groq", "m", "rate", 120_000);
+    expect(tracker.cooldownRemainingMs("groq", "m")).toBe(120_000);
+  });
+
+  it("does not let a shorter Retry-After reduce the computed backoff", () => {
+    const tracker = new RateLimitTracker(() => 1_000);
+    tracker.penalize("groq", "m", "rate", 10_000);
+    expect(tracker.cooldownRemainingMs("groq", "m")).toBe(60_000);
+  });
+
   it("uses a shorter, 5-minute-capped backoff for generic errors", () => {
     const tracker = new RateLimitTracker(() => 0);
     tracker.penalize("deepseek", "deepseek-chat", "error");

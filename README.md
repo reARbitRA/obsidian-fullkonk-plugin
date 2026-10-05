@@ -1,13 +1,16 @@
-# fullKONK_> — Obsidian AI Full-Stack Builder
+# fullKONK_> — Obsidian AI Builder + Vault & Notes Workspace
 
-`fullKONK_>` is an [Obsidian](https://obsidian.md) plugin that turns your vault into a
-multi-provider, multi-stage AI product-builder — a "Google AI Studio, but with a real
-backend" that runs entirely client-side, orchestrating **9 free-tier LLM providers**
+`fullKONK_>` is an [Obsidian](https://obsidian.md) plugin that combines a
+multi-provider, multi-stage AI product builder with a safe, vault-native notes
+workspace. The builder is a "Google AI Studio, but with a real backend" that runs
+client-side, orchestrating **12 free-tier LLM providers**
 (Groq, DeepSeek, Google Gemini, Cerebras, SambaNova, OpenRouter, NVIDIA NIM, GitHub
-Models, HuggingFace) with automatic scoring, rate-limit tracking, and failover.
+Models, HuggingFace, Mistral, Together AI, Fireworks AI) with automatic scoring,
+rate-limit tracking, per-stage routing, and failover.
 
-No server. No account. No vendor lock-in. Your API keys and every generated file stay
-inside your local Obsidian vault.
+No server. No account. No vendor lock-in. Your API keys, notes, and generated files stay
+inside your local Obsidian vault. A note's path and content are sent to a configured
+provider only when you explicitly opt in and run an AI note action.
 
 > This repository was reorganized from a set of product/architecture research notes
 > (see [`research/`](./research)) into a fully implemented, tested, and buildable
@@ -42,20 +45,45 @@ inside your local Obsidian vault.
 - **Multi-stage build pipeline** — `architect → frontend → backend → verify`, each
   stage streamed from the best-available provider for that task, or a single-shot
   `review` mode for reviewing/fixing existing code.
-- **9 built-in free-tier providers**, all OpenAI-`/chat/completions`-compatible
-  (including Gemini via its OpenAI compatibility shim), so adding a 10th is a ~20-line
+- **12 built-in free-tier providers**, all OpenAI-`/chat/completions`-compatible
+  (including Gemini via its OpenAI compatibility shim), so adding a 13th is a ~20-line
   registry entry (`src/providers/registry.ts`).
 - **Automatic scoring + failover** — every (provider, model) candidate is scored per
   task from capability/thinking/speed weights, tie-broken by a curated per-task
   priority order, and re-tried against the next candidate on HTTP 429, any other
   error, or an empty completion — with exponential-backoff cooldowns so a single
   exhausted free tier doesn't get hammered.
+- **Per-stage routing pins** — pin a specific provider *and model* to any stage
+  (architect / frontend / backend / verify / review) in Settings; the pin is promoted
+  to the front of that stage's candidate list while automatic failover keeps working
+  behind it.
+- **Session stats** — every stage records tokens streamed, wall-clock duration and the
+  provider/model that actually served it; a strip under the terminal shows the
+  session total (Σ tokens · tok/s · duration) and expands into a per-stage breakdown,
+  and the same numbers are written into the saved history note's frontmatter.
+- **Export options** — copy a single file (**⎘ COPY**), copy the whole project as one
+  Markdown bundle (**⎘ COPY ALL**), save every file individually (**↓ SAVE ALL**),
+  write a shareable Markdown bundle (**≡ BUNDLE**) or a real **.zip** archive
+  (**⤓ ZIP**) into `<outputFolder>/exports/` — the ZIP is written by a small built-in
+  STORE-method writer (`src/utils/zip.ts`), so no native dependency is needed.
 - **Live streaming UI** — a two-pane terminal (chat transcript + generated file
   browser with line numbers and tabs) built directly on Obsidian's `ItemView` API,
   no React/webpack/iframe required.
 - **Vault-native persistence** — generated files and full chat transcripts are saved
   as real Markdown/code files inside your vault (`fullKONK/<project>-<timestamp>/`),
   fully offline-capable and versionable with the rest of your notes.
+- **Vault & Notes workspace** — a separate Obsidian view for reading Markdown notes,
+  searching titles/paths/tags/categories (optionally note contents), and sorting by
+  name, path, created, or modified date. Read a rendered Markdown preview or open
+  notes in Obsidian's editor; stage edits with Markdown formatting shortcuts and
+  compare before applying.
+- **Safe organization tools** — move or rename one or many notes (using Obsidian's
+  link-aware FileManager), batch-add/remove tags, and set/clear a `category` YAML
+  frontmatter property. Moves and metadata updates show a preview; edit and batch
+  metadata writes check for concurrent changes.
+- **Optional AI note assistant** — summarize or rewrite a selected note using the
+  configured provider. The view requires explicit consent before transmitting note
+  text, and results remain drafts until you preview and apply them.
 - **Desktop + mobile** — `isDesktopOnly: false`, uses only `fetch`/Obsidian's `Vault`
   API, no Node/Electron APIs.
 - **Showcase prompt gallery** — six ready-to-run product briefs to try the pipeline
@@ -94,14 +122,19 @@ inside your local Obsidian vault.
 └───────────────────────────────────────────────────────────────────────────┘
 ```
 
+The separate **Vault & Notes** view (`VaultNotesView`) uses Obsidian's own `Vault`,
+`MetadataCache`, and `FileManager` APIs for note reads, previewed edits, link-aware
+moves, and frontmatter changes; routine organization works without an API key.
+
 Every provider talks OpenAI's `/chat/completions` wire format (`stream: true`,
 Server-Sent Events), so `streamCandidate()` is a single, provider-agnostic code path —
 adding a provider is purely a registry/data change, not new request logic.
 
 ## Quickstart
 
-**Requirements:** Node.js ≥ 18 (Node 20+ recommended), an Obsidian vault, and at least
-one free API key from any provider below.
+**Requirements:** Node.js ≥ 18 (Node 20+ recommended), Obsidian ≥ 1.4.4, an Obsidian
+vault, and at least one free API key from any provider below for the builder/AI note
+assistant. Reading and organizing vault notes does not require an API key.
 
 ```bash
 # 1. Clone and install
@@ -137,6 +170,9 @@ rebuilds `main.js` on every save) — reload Obsidian (`Ctrl/Cmd+R` in dev tools
 | NVIDIA NIM | Free evaluation tier | https://build.nvidia.com |
 | GitHub Models | Free for prototyping | https://github.com/settings/tokens |
 | HuggingFace | Serverless Inference API | https://huggingface.co/settings/tokens |
+| Mistral | Free experiment tier (Mistral Large / Codestral) | https://console.mistral.ai |
+| Together AI | Free Llama 3.3 / R1 Distill endpoints | https://api.together.xyz/settings/api-keys |
+| Fireworks AI | Free starting credit, very fast inference | https://fireworks.ai/account/api-keys |
 
 You only need **one** key to get started — the orchestrator automatically skips any
 provider whose key is blank.
@@ -152,6 +188,10 @@ happens in Obsidian's own Settings UI (**Settings → fullKONK_>**), backed by
 - **Provider API keys** — one field per provider (see table above).
 - **Default Mode** — `fullstack | frontend | backend | review`.
 - **Temperature** (0–1) and **Max Output Tokens** (256–65536) per generation stage.
+- **Per-Stage Routing** — one row per stage with a provider dropdown
+  (`Auto (recommended)` + every provider) and, once a provider is pinned, a model
+  dropdown for that provider. Pins are advisory-first, not exclusive: the pinned
+  pair is tried first and the automatic ranking remains as fallback.
 - **Request Timeout** — how long to wait for a provider before treating it as failed
   and failing over (10–300s).
 - **Output Folder** — vault-relative folder generated projects/history are saved
@@ -174,12 +214,25 @@ back to safe defaults per-field.
    with the active provider/model and live tokens/sec shown.
 5. Generated files are auto-extracted from fenced code blocks (matched on a leading
    `// path/to/file` or `# path/to/file` comment) and appear as tabs in the right-hand
-   panel — click **⎘ COPY** for the active file or **↓ SAVE ALL** to write every file
-   into your vault under `<outputFolder>/<slug>-<timestamp>/`, alongside an
-   auto-generated `README.md` index.
-6. If a provider is rate-limited or errors out mid-stream, you'll see a transient
+   panel. From left to right the action bar offers: **⎘ COPY** (active file),
+   **⎘ COPY ALL** (whole project as one Markdown bundle on the clipboard),
+   **⤓ ZIP** (real `.zip` archive), **≡ BUNDLE** (single Markdown bundle note) and
+   **↓ SAVE ALL** (every file written individually under
+   `<outputFolder>/<slug>-<timestamp>/`, alongside an auto-generated `README.md`
+   index). ZIP and bundle exports land in `<outputFolder>/exports/`.
+6. Under the terminal, a stats strip appears once a build finishes: click it to expand
+   the per-stage breakdown (tokens · duration · provider/model); the collapsed line
+   shows the session totals.
+7. If a provider is rate-limited or errors out mid-stream, you'll see a transient
    notice (`"<provider> rate limited → switching to <provider>"`) and the pipeline
    keeps going on the next-best candidate — no user action needed.
+8. Open **Vault & Notes** from the command palette (`fullKONK_>: Open Vault & Notes`)
+   or the **☷ NOTES** button. Search note titles/paths/tags/categories; enable
+   **Search inside notes** to scan note bodies; sort and filter the list; select one or
+   more notes to move them or update frontmatter tags/categories. Select a note to read
+   it, open it in Obsidian, or edit and format a draft. Review the before/proposed
+   preview and choose Apply before any change is written. AI summary/rewrite is optional
+   and requires a separate consent checkbox.
 
 ## Provider registry & routing algorithm
 
@@ -204,6 +257,10 @@ task-specific weights:
    exponential backoff: 60s→900s cap for HTTP 429, 30s→300s cap for other errors).
 3. Sorts by score descending, breaking ties using the provider's task-specific
    `priority` (ascending — lower number wins).
+4. Promotes any per-stage pin from settings (`applyStagePin()`) to the head of the
+   list. A pin that can't be honored — unknown provider id, no API key configured, or
+   every model of that provider in cooldown — is ignored, so stale `data.json`
+   contents can never break routing.
 
 `orchestrate()` walks that ranked list, streaming from each candidate in turn via
 `streamCandidate()` until one returns a non-empty completion, emitting `onProvider` /
@@ -216,12 +273,15 @@ configured at all, it throws `NoProvidersConfiguredError` up front.
 ```
 obsidian-fullkonk-plugin/
 ├── manifest.json            # Obsidian plugin manifest (isDesktopOnly: false)
-├── styles.css               # Cross-cutting CSS (most styling is inline in view.ts)
+├── styles.css               # Builder + theme-aware Vault & Notes workspace styles
 ├── package.json / tsconfig.json / tsconfig.test.json / esbuild.config.mjs
 ├── .env.example             # Documents dev/CI-only env vars (no plugin secrets)
 ├── src/
 │   ├── main.ts               # Plugin entry point (onload/onunload/activateView)
-│   ├── view.ts                # FullKonkView — the two-pane ItemView UI + pipeline
+│   ├── view.ts                # FullKonkView — builder ItemView + pipeline
+│   ├── notesView.ts           # VaultNotesView — browse/read/edit/organize ItemView
+│   ├── notesManager.ts        # VaultNotesManager — guarded Vault/FileManager operations
+│   ├── notes.ts               # Search/sort/formatting + move/metadata planning helpers
 │   ├── settings.ts            # FullKonkSettingsTab — Obsidian settings UI
 │   ├── orchestrator.ts        # Scoring, candidate ranking, SSE streaming, failover
 │   ├── providers/
@@ -230,10 +290,13 @@ obsidian-fullkonk-plugin/
 │   ├── templates.ts           # System prompts per stage + showcase prompt gallery
 │   ├── fileExtractor.ts       # Parses generated files out of fenced code blocks
 │   ├── vault.ts                # VaultManager — save/read generated files & history
+│   ├── exporter.ts             # Pure Markdown-bundle builder (clipboard + vault)
+│   ├── stats.ts                # Pure session/stage token-throughput accounting
 │   ├── errors.ts               # Structured error hierarchy (FullKonkError subtypes)
 │   ├── types.ts                 # Shared types + settings sanitizer
 │   ├── utils/
 │   │   ├── uuid.ts              # crypto.randomUUID() with a manual v4 fallback
+│   │   ├── zip.ts               # Dependency-free STORE-method ZIP writer
 │   │   └── logger.ts            # Leveled logger (env-driven only outside Obsidian)
 │   ├── __mocks__/obsidian.ts    # In-memory Obsidian API reimplementation for tests
 │   └── __tests__/                # Full unit/integration test suite (Jest)
@@ -267,37 +330,62 @@ npm run test:watch     # watch mode
 npm run test:coverage  # run with coverage thresholds enforced (see jest.config.js)
 ```
 
-The suite has **115 tests across 13 files** and enforces minimum coverage of
-**80% statements / 70% branches / 80% functions / 80% lines** (actual: ~94% / 84% /
-92% / 96% at time of writing). It covers:
+The suite has **227 tests across 19 files** and enforces minimum coverage of
+**80% statements / 70% branches / 80% functions / 80% lines** (current: 90.23% /
+75.06% / 90.39% / 92.59%). It covers:
 
 - **`orchestrator.test.ts`** — scoring weights, candidate filtering/ranking/tie-break,
-  SSE stream parsing (via real `Response`/`ReadableStream` fixtures), HTTP 429 →
-  `RateLimitError`, non-2xx → `ProviderRequestError`, empty-completion skip, full
-  multi-candidate failover, abort-signal short-circuiting, `NoProvidersConfiguredError`
-  / `AllProvidersFailedError`.
+  per-stage pin promotion (exact model, model fallback within a pinned provider,
+  unknown/unconfigured/cooled-down pins ignored, per-stage scoping), SSE stream
+  parsing across fragmented chunks, provider-specific OpenRouter headers, HTTP 429 →
+  `RateLimitError` with Retry-After, non-2xx → `ProviderRequestError`, empty-completion
+  skip, full multi-candidate failover with reason reporting, abort-signal short-circuiting,
+  and distinct `NoProvidersConfiguredError` / `AllProvidersCoolingDownError` /
+  `AllProvidersFailedError` cases.
 - **`rateLimitTracker.test.ts`** — cooldown windows, exponential backoff + caps,
-  independent per-(provider, model) tracking, reward-clears-cooldown, reset.
+  server-specified Retry-After delays, independent per-(provider, model) tracking,
+  reward-clears-cooldown, reset.
 - **`fileExtractor.test.ts`** — path-comment parsing, positional fallback naming,
-  overwrite-by-path semantics, minimum-block-length filtering.
-- **`vault.test.ts`** — safe-name sanitization, timestamp slugs, generated-file
-  persistence (including nested paths + README index), chat history frontmatter,
-  vault-file-as-context reads, project listing/sorting via README frontmatter.
-- **`view.test.ts`** — full pipeline sequencing per mode, live file extraction while
-  streaming, error handling + Notices, abort/stop, mode switching (incl. being
-  disabled mid-build), every button/keyboard interaction (templates, clear, save,
-  copy incl. clipboard failure, file tabs, Enter/Shift+Enter).
+  overwrite-by-path semantics, minimum-block-length filtering, nested Markdown fences.
+- **`vault.test.ts`** — Unicode-safe name sanitization, timestamp slugs, generated-file
+  persistence (including nested paths + README index), chat history frontmatter with
+  and without session stats, ZIP + Markdown-bundle exports (byte-level signature and
+  entry assertions), vault-file-as-context reads, project listing/sorting via README
+  frontmatter.
+- **`zip.test.ts`** — canonical CRC-32 vectors, local/central/EOCD record layout
+  (parsed back by an in-test ZIP reader), UTF-8 names and content, path normalization,
+  DOS timestamps incl. pre-1980 clamping, empty archives and empty-path rejection.
+- **`stats.test.ts` / `exporter.test.ts`** — session aggregation, token estimation,
+  duration/tps formatters, fence widening for nested backticks, and bundle frontmatter.
+- **`notes.test.ts`** — tag/category normalization, search and sorting, Markdown
+  formatting transforms, traversal-safe path validation, move planning, and metadata previews.
+- **`notesManager.test.ts`** — vault note indexing/reading, edit conflict detection,
+  nested link-aware moves, collision/rollback safety, and frontmatter updates that
+  preserve unrelated properties and reject stale batch previews.
+- **`notesView.test.ts`** — note listing/search/content search, preview-first editing
+  and formatting, opening notes in Obsidian, move/rename and multi-note metadata UI,
+  explicit AI consent, summary/rewrite drafts, stale-edit rejection, refresh safety,
+  and cancellation of late responses when switching notes.
+- **`view.test.ts`** — full pipeline sequencing per mode, mode-accurate stage bars,
+  live file extraction while streaming, clean partial-output failover, error handling +
+  Notices, abort/stop, mode switching (incl. being disabled mid-build), every button/keyboard interaction (templates, clear, save,
+  copy incl. clipboard failure, file tabs, Enter/Shift+Enter), the session-stats strip
+  (hidden until a build, per-stage recording, expansion, failure marking, reset) and
+  every export action incl. failure paths.
 - **`settings.test.ts`**, **`main.test.ts`**, **`types.test.ts`**, **`errors.test.ts`**,
   **`registry.test.ts`**, **`templates.test.ts`**, **`uuid.test.ts`**,
-  **`logger.test.ts`** — settings persistence/sanitization, plugin lifecycle
+  **`logger.test.ts`** — settings persistence/sanitization (incl. routing-pin
+  sanitization and the per-stage dropdowns), plugin lifecycle
   (register/activate/reuse leaves/unload), error hierarchy invariants, provider
-  registry data integrity, and small pure utilities.
+  registry data integrity (12 providers, unique ids/settings keys), and small pure
+  utilities.
 
 Because the real `obsidian` npm package ships **types only** (no runtime — Obsidian
 itself provides the implementation), [`src/__mocks__/obsidian.ts`](./src/__mocks__/obsidian.ts)
 is a from-scratch, in-memory reimplementation of the exact slice of the API this
-plugin uses (`App`/`Vault`/`TFile`/`TFolder`, `Plugin`, `ItemView`, `PluginSettingTab`,
-`Setting` + its field components, `Notice`, `WorkspaceLeaf`) wired up via Jest's
+plugin uses (`App`/`Vault`/`TFile`/`TFolder`, `FileManager`, `MetadataCache`,
+`MarkdownRenderer`, `Plugin`, `ItemView`, `PluginSettingTab`, `Setting` + its field
+components, `Notice`, `WorkspaceLeaf`) wired up via Jest's
 `moduleNameMapper`, plus a `setupFilesAfterEach` polyfill
 ([`src/__tests__/setup.ts`](./src/__tests__/setup.ts)) for the DOM convenience methods
 (`createDiv`, `createEl`, `setText`, `empty`, …) Obsidian installs onto
@@ -334,17 +422,55 @@ Returns the full completion text; throws `NoProvidersConfiguredError` /
 ### `buildCandidates(settings, task, tracker?, providers?)`
 Pure function returning the ranked list of usable `{ provider, model, score }`
 candidates for a task — the core of the routing algorithm, fully unit-testable
-without any network access.
+without any network access. Honors `settings.stageRouting[task]` by calling
+`applyStagePin()` before returning.
+
+### `applyStagePin(candidates, settings, task)`
+Moves the pinned (provider, model) for a task to the head of the candidate list.
+Silently returns the input unchanged when the pin is unknown, unconfigured, or fully
+cooled down.
 
 ### `VaultManager`
 `saveGeneratedFiles(projectName, files)`, `saveChatHistory(projectName, messages, mode,
-provider)`, `readFilesAsContext(paths)`, `listProjects()` — all vault I/O, using only
-Obsidian's `Vault` API (safe on desktop and mobile). See
-[`src/vault.ts`](./src/vault.ts).
+provider, stats?)`, `exportZip(projectName, files)` (→
+`<outputFolder>/exports/<name>-<timestamp>.zip`), `saveBundle(projectName, files)`
+(→ `.../<name>-<timestamp>.md`), `readFilesAsContext(paths)`, `listProjects()` — all
+vault I/O, using only Obsidian's `Vault`/`createBinary` API (safe on desktop and
+mobile). See [`src/vault.ts`](./src/vault.ts).
+
+### `VaultNotesManager`
+`listNotes()`, `readNote()`, `saveNote(file, expected, next)` (rejects stale edit
+previews), `validateMovePlan()` / `moveNotes()` (link-aware `FileManager.renameFile`),
+and `applyMetadata()` (Obsidian `processFrontMatter`, preserving unrelated YAML).
+Batch frontmatter is preflighted before writes and rechecked during each atomic note
+update. See [`src/notesManager.ts`](./src/notesManager.ts).
+
+### `notes.ts`
+Pure helpers for filtering/sorting note records, tag normalization, frontmatter change
+plans, safe vault-relative move plans, and selection-based Markdown formatting. The
+move planner rejects traversal, invalid names, and duplicate destinations.
+The UI is `VaultNotesView` (`src/notesView.ts`), opened with the command
+`fullKONK_>: Open Vault & Notes` or the builder's **☷ NOTES** button.
 
 ### `extractFiles(content)`
 Pure function: parses fenced code blocks with an optional leading `// path` / `# path`
 comment into `GeneratedFile[]`. See [`src/fileExtractor.ts`](./src/fileExtractor.ts).
+
+### `stats.ts`
+`createSessionStats()`, `startSession()`, `recordStage()`, `estimateTokens()` (~4
+chars/token), `totalTokens()`, `totalDurationMs()`, `averageTps()`, `summarize()`, plus
+`formatTokens/formatDuration/formatTps/formatSummaryLine/formatStageLine`. Pure and
+`obsidian`-free.
+
+### `exporter.ts`
+`fenceCode(content, language)` (widens the fence when the body contains backticks) and
+`buildBundleMarkdown(projectName, files, timestamp)` — the single source of truth for
+the bundle format used by both the vault export and the clipboard "copy all" action.
+
+### `utils/zip.ts`
+`createZip(entries, date?)` → `Uint8Array`, plus `crc32()` and `normalizeZipPath()`.
+Dependency-free STORE-method (uncompressed) ZIP writer with UTF-8 filenames; used by
+`VaultManager.exportZip()`.
 
 ### Error hierarchy
 `FullKonkError` (base) → `NoProvidersConfiguredError`, `RateLimitError`,

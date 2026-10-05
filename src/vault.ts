@@ -9,6 +9,9 @@ import { App, TFile, TFolder, normalizePath } from "obsidian";
 import { BuildMode, FKMessage, GeneratedFile } from "./types";
 import { VaultOperationError } from "./errors";
 import { logger } from "./utils/logger";
+import { SessionStats, formatDuration, formatStageLine, formatTokens, summarize } from "./stats";
+import { createZip, ZipEntry } from "./utils/zip";
+import { buildBundleMarkdown } from "./exporter";
 
 export interface VaultProjectSummary {
   name: string;
@@ -18,10 +21,18 @@ export interface VaultProjectSummary {
 
 const MAX_SAFE_NAME_LENGTH = 40;
 
-/** Sanitize a free-form string into a filesystem-safe folder/file name segment. */
+// Reserved path characters across supported desktop/mobile filesystems, plus
+// ASCII controls. Other scripts are preserved instead of being dropped.
+// eslint-disable-next-line no-control-regex -- intentionally strips ASCII control characters from file names
+const UNSAFE_PATH_CHARS_RE = /[\\/:*?"<>|\u0000-\u001f]/g;
+const NON_WORD_RUN_RE = /[^\p{L}\p{N}_-]+/gu;
+
+/** Sanitize a free-form string while preserving letters from every script. */
 export function toSafeName(input: string): string {
-  const cleaned = input.replace(/[^a-zA-Z0-9_-]+/g, "_").replace(/^_+|_+$/g, "");
-  const truncated = cleaned.slice(0, MAX_SAFE_NAME_LENGTH);
+  const withoutUnsafeChars = input.replace(UNSAFE_PATH_CHARS_RE, " ");
+  const collapsed = withoutUnsafeChars.replace(NON_WORD_RUN_RE, "_").replace(/^_+|_+$/g, "");
+  // Slice by Unicode code point so a surrogate pair is never split.
+  const truncated = Array.from(collapsed).slice(0, MAX_SAFE_NAME_LENGTH).join("");
   return truncated.length > 0 ? truncated : "untitled";
 }
 
@@ -81,6 +92,20 @@ export class VaultManager {
     }
   }
 
+  private async writeBinaryFile(path: string, bytes: Uint8Array): Promise<void> {
+    const normalized = normalizePath(path);
+    await this.ensureParentFolders(normalized);
+    // `slice()` guarantees a tightly-sized ArrayBuffer even when the view is a
+    // window into a larger buffer, which some Vault implementations reject.
+    const buffer = bytes.slice().buffer;
+    const existing = this.app.vault.getAbstractFileByPath(normalized);
+    if (existing instanceof TFile) {
+      await this.app.vault.modifyBinary(existing, buffer);
+    } else {
+      await this.app.vault.createBinary(normalized, buffer);
+    }
+  }
+
   // ─── Save generated files ──────────────────────────────────────────────
 
   /** Persist a batch of generated files under `<outputFolder>/<name>-<timestamp>/`. */
@@ -107,6 +132,53 @@ export class VaultManager {
     return folder;
   }
 
+  // ─── Exports ───────────────────────────────────────────────────────────
+
+  /**
+   * Export generated files as a ZIP archive under `<outputFolder>/exports/`.
+   * Returns the vault path of the written archive.
+   */
+  async exportZip(projectName: string, files: GeneratedFile[]): Promise<string> {
+    if (files.length === 0) {
+      throw new VaultOperationError("exportZip() called with an empty file list.");
+    }
+
+    const safeName = toSafeName(projectName);
+    const timestamp = timestampSlug(this.now());
+    const folder = normalizePath(`${this.outputFolder}/exports`);
+
+    await this.ensureFolder(this.outputFolder);
+    await this.ensureFolder(folder);
+
+    const entries: ZipEntry[] = files.map((file) => ({ path: file.path, content: file.content }));
+    const archive = createZip(entries, this.now());
+    const path = normalizePath(`${folder}/${safeName}-${timestamp}.zip`);
+    await this.writeBinaryFile(path, archive);
+    return path;
+  }
+
+  /**
+   * Export every generated file into a single Markdown bundle (fenced code
+   * blocks with path headers) — handy for sharing a whole project as one note.
+   */
+  async saveBundle(projectName: string, files: GeneratedFile[]): Promise<string> {
+    if (files.length === 0) {
+      throw new VaultOperationError("saveBundle() called with an empty file list.");
+    }
+
+    const safeName = toSafeName(projectName);
+    const timestamp = timestampSlug(this.now());
+    const folder = normalizePath(`${this.outputFolder}/exports`);
+
+    await this.ensureFolder(this.outputFolder);
+    await this.ensureFolder(folder);
+
+    const content = buildBundleMarkdown(projectName, files, timestamp);
+    const path = normalizePath(`${folder}/${safeName}-${timestamp}.md`);
+    await this.writeFile(path, content);
+    return path;
+  }
+
   // ─── Save chat history ─────────────────────────────────────────────────
 
   /** Persist a full pipeline transcript as a single Markdown note. */
@@ -114,7 +186,8 @@ export class VaultManager {
     projectName: string,
     messages: FKMessage[],
     mode: BuildMode,
-    provider: string
+    provider: string,
+    stats?: SessionStats
   ): Promise<string> {
     const safeName = toSafeName(projectName);
     const timestamp = timestampSlug(this.now());
@@ -123,12 +196,21 @@ export class VaultManager {
     await this.ensureFolder(this.outputFolder);
     await this.ensureFolder(folder);
 
+    const summary = stats && stats.stages.length > 0 ? summarize(stats) : null;
+
     const content = [
       "---",
       `project: ${projectName.replace(/"/g, "'")}`,
       `mode: ${mode}`,
       `provider: ${provider || "unknown"}`,
       `date: ${timestamp}`,
+      ...(summary
+        ? [
+            `tokens: ${summary.totalTokens}`,
+            `duration: ${formatDuration(summary.totalDurationMs)}`,
+            `stages: ${summary.stageCount}`,
+          ]
+        : []),
       `tags: [fullkonk, ${mode}]`,
       "---",
       "",
@@ -138,6 +220,17 @@ export class VaultManager {
         const role = m.role === "user" ? "**You**" : `**AI** (${m.stage ?? "response"})`;
         return `### ${role}\n${m.content}\n`;
       }),
+      ...(summary
+        ? [
+            "## Session stats",
+            "",
+            `- **Total:** ${formatTokens(summary.totalTokens)} tokens · ${formatDuration(
+              summary.totalDurationMs
+            )} · ${summary.averageTps.toFixed(1)} tok/s`,
+            ...stats!.stages.map((stage) => `- ${formatStageLine(stage)}`),
+            "",
+          ]
+        : []),
     ].join("\n");
 
     const path = normalizePath(`${folder}/${safeName}-${timestamp}.md`);

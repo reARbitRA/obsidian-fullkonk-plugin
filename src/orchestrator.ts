@@ -11,6 +11,7 @@ import { PROVIDERS } from "./providers/registry";
 import { RateLimitTracker, defaultRateLimitTracker } from "./providers/rateLimitTracker";
 import { logger } from "./utils/logger";
 import {
+  AllProvidersCoolingDownError,
   AllProvidersFailedError,
   EmptyCompletionError,
   NoProvidersConfiguredError,
@@ -51,10 +52,42 @@ export interface Candidate {
 }
 
 /**
+ * Promote a user-pinned (provider, model) for this task to the head of the
+ * candidate list. Automatic ranking still governs everything behind it, so a
+ * pinned provider that is rate limited or fails simply fails over as usual.
+ *
+ * The pin is silently ignored when it cannot be honored — unknown provider id,
+ * no API key configured, or every model of that provider in cooldown — which
+ * keeps routing resilient to stale `data.json` files.
+ */
+export function applyStagePin(
+  candidates: Candidate[],
+  settings: FullKonkSettings,
+  task: TaskType
+): Candidate[] {
+  const pin = settings.stageRouting?.[task];
+  if (!pin || !pin.provider) return candidates;
+
+  const fromPinnedProvider = candidates.filter((c) => c.provider.id === pin.provider);
+  if (fromPinnedProvider.length === 0) return candidates;
+
+  const exact = pin.model ? fromPinnedProvider.find((c) => c.model.id === pin.model) : undefined;
+  const preferred = exact ?? fromPinnedProvider[0];
+  const index = candidates.indexOf(preferred);
+  if (index <= 0) return candidates;
+
+  const reordered = candidates.slice();
+  reordered.splice(index, 1);
+  reordered.unshift(preferred);
+  return reordered;
+}
+
+/**
  * Build the ranked list of usable (provider, model) candidates for a task:
  * only providers with a non-empty API key configured, only models that are
  * not currently in a rate-limit cooldown, ranked by weighted score, with the
- * provider's task-specific `priority` used as an ascending tie-breaker.
+ * provider's task-specific `priority` used as an ascending tie-breaker, and
+ * any per-stage pin from settings promoted to the front.
  */
 export function buildCandidates(
   settings: FullKonkSettings,
@@ -74,10 +107,12 @@ export function buildCandidates(
     }
   }
 
-  return out.sort((a, b) => {
+  out.sort((a, b) => {
     if (b.score !== a.score) return b.score - a.score;
     return a.provider.priority[task] - b.provider.priority[task];
   });
+
+  return applyStagePin(out, settings, task);
 }
 
 // ─── STREAMING ──────────────────────────────────────────────────────────────
@@ -124,16 +159,22 @@ export async function streamCandidate(
   const timeoutHandle = setTimeout(() => timeoutController.abort(), timeoutMs);
   const combinedSignal = combineSignals(signal, timeoutController.signal);
 
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${apiKey}`,
+    "Content-Type": "application/json",
+  };
+  // These attribution headers are specific to OpenRouter. Sending custom
+  // headers to other providers can fail strict browser CORS preflights.
+  if (provider.id === "openrouter") {
+    headers["HTTP-Referer"] = "https://konkred.xyz";
+    headers["X-Title"] = "fullKONK_> Obsidian Plugin";
+  }
+
   let response: Response;
   try {
     response = await fetchImpl(`${provider.baseUrl}/chat/completions`, {
       method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-        "HTTP-Referer": "https://konkred.xyz",
-        "X-Title": "fullKONK_> Obsidian Plugin",
-      },
+      headers,
       body: JSON.stringify({
         model: model.id,
         messages,
@@ -143,16 +184,25 @@ export async function streamCandidate(
       }),
       signal: combinedSignal,
     });
-  } finally {
+  } catch (error) {
     clearTimeout(timeoutHandle);
+    throw error;
   }
 
   if (!response.ok) {
-    const errText = await response.text().catch(() => "");
+    let errText = "";
+    try {
+      errText = await response.text().catch(() => "");
+    } finally {
+      clearTimeout(timeoutHandle);
+    }
     if (response.status === 429) {
-      tracker.penalize(provider.id, model.id, "rate");
       const retryAfterHeader = response.headers.get("retry-after");
-      const retryAfterMs = retryAfterHeader ? Number(retryAfterHeader) * 1000 : undefined;
+      const parsedRetryAfter = retryAfterHeader ? Number(retryAfterHeader) : NaN;
+      const retryAfterMs = Number.isFinite(parsedRetryAfter) && parsedRetryAfter > 0
+        ? parsedRetryAfter * 1000
+        : undefined;
+      tracker.penalize(provider.id, model.id, "rate", retryAfterMs);
       throw new RateLimitError(provider.id, model.id, retryAfterMs);
     }
     tracker.penalize(provider.id, model.id, "error");
@@ -162,8 +212,11 @@ export async function streamCandidate(
   if (!response.body) {
     // Some fetch polyfills (or misconfigured mocks) may not implement streaming;
     // still support returning a fully-buffered payload gracefully.
-    const text = await response.text();
-    return text;
+    try {
+      return await response.text();
+    } finally {
+      clearTimeout(timeoutHandle);
+    }
   }
 
   const reader = response.body.getReader();
@@ -171,42 +224,51 @@ export async function streamCandidate(
   let full = "";
   let tokensSinceLastTick = 0;
   let lastTick = Date.now();
+  let lineBuffer = "";
+
+  const processLine = (line: string): void => {
+    if (!line.startsWith("data: ")) return;
+    const raw = line.slice(6).trim();
+    if (!raw || raw === "[DONE]") return;
+
+    let parsed: ChatCompletionChunk;
+    try {
+      parsed = JSON.parse(raw) as ChatCompletionChunk;
+    } catch {
+      return;
+    }
+
+    const text = parsed.choices?.[0]?.delta?.content ?? "";
+    if (text) {
+      full += text;
+      tokensSinceLastTick += Math.ceil(text.length / 4);
+      callbacks.onChunk(text);
+    }
+
+    const now = Date.now();
+    const elapsed = now - lastTick;
+    if (elapsed > 500) {
+      callbacks.onMetrics(Math.round((tokensSinceLastTick / elapsed) * 1000), tokensSinceLastTick);
+      lastTick = now;
+    }
+  };
 
   try {
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
 
-      const chunkText = decoder.decode(value, { stream: true });
-      for (const line of chunkText.split("\n")) {
-        if (!line.startsWith("data: ")) continue;
-        const raw = line.slice(6).trim();
-        if (!raw || raw === "[DONE]") continue;
-
-        let parsed: ChatCompletionChunk;
-        try {
-          parsed = JSON.parse(raw) as ChatCompletionChunk;
-        } catch {
-          continue;
-        }
-
-        const text = parsed.choices?.[0]?.delta?.content ?? "";
-        if (text) {
-          full += text;
-          tokensSinceLastTick += Math.ceil(text.length / 4);
-          callbacks.onChunk(text);
-        }
-
-        const now = Date.now();
-        const elapsed = now - lastTick;
-        if (elapsed > 500) {
-          callbacks.onMetrics(Math.round((tokensSinceLastTick / elapsed) * 1000), tokensSinceLastTick);
-          lastTick = now;
-        }
-      }
+      lineBuffer += decoder.decode(value, { stream: true });
+      const lines = lineBuffer.split("\n");
+      lineBuffer = lines.pop() ?? "";
+      for (const line of lines) processLine(line.replace(/\r$/, ""));
     }
+
+    lineBuffer += decoder.decode();
+    if (lineBuffer.trim()) processLine(lineBuffer.replace(/\r$/, ""));
   } finally {
     reader.releaseLock?.();
+    clearTimeout(timeoutHandle);
   }
 
   return full;
@@ -244,9 +306,24 @@ export async function orchestrate(
     throw new Error("orchestrate() requires at least one message.");
   }
 
-  const candidates = buildCandidates(settings, task, tracker, options.providers);
-  if (candidates.length === 0) {
+  const allProviders = options.providers ?? PROVIDERS;
+  const configuredProviders = allProviders.filter((provider) => {
+    const key = settings[provider.settingsKey];
+    return typeof key === "string" && key.trim().length > 0;
+  });
+  if (configuredProviders.length === 0) {
     throw new NoProvidersConfiguredError();
+  }
+
+  const candidates = buildCandidates(settings, task, tracker, allProviders);
+  if (candidates.length === 0) {
+    let retryInMs = Infinity;
+    for (const provider of configuredProviders) {
+      for (const model of provider.models) {
+        retryInMs = Math.min(retryInMs, tracker.cooldownRemainingMs(provider.id, model.id));
+      }
+    }
+    throw new AllProvidersCoolingDownError(Number.isFinite(retryInMs) ? retryInMs : 0);
   }
 
   let lastErrorMessage = "";
@@ -254,16 +331,16 @@ export async function orchestrate(
   for (let i = 0; i < candidates.length; i++) {
     const candidate = candidates[i];
     callbacks.onProvider(candidate.provider.name, candidate.model.label);
-
-    if (i > 0) {
-      const prev = candidates[i - 1];
-      callbacks.onFailover(
-        `${prev.provider.name} / ${prev.model.label}`,
-        `${candidate.provider.name} / ${candidate.model.label}`
-      );
-    }
-
     const apiKey = settings[candidate.provider.settingsKey];
+    const next = candidates[i + 1];
+    const reportFailover = (reason: string): void => {
+      if (!next) return;
+      callbacks.onFailover(
+        `${candidate.provider.name} / ${candidate.model.label}`,
+        `${next.provider.name} / ${next.model.label}`,
+        reason
+      );
+    };
 
     try {
       const result = await streamCandidate(
@@ -282,6 +359,7 @@ export async function orchestrate(
       if (!result.trim()) {
         tracker.penalize(candidate.provider.id, candidate.model.id, "error");
         lastErrorMessage = new EmptyCompletionError(candidate.provider.id, candidate.model.id).message;
+        reportFailover(lastErrorMessage);
         continue;
       }
 
@@ -291,6 +369,7 @@ export async function orchestrate(
       if (signal?.aborted) throw err;
       lastErrorMessage = err instanceof Error ? err.message : String(err);
       logger.debug(`candidate ${candidate.provider.id}/${candidate.model.id} failed: ${lastErrorMessage}`);
+      reportFailover(lastErrorMessage);
       continue;
     }
   }

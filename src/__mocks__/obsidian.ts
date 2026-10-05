@@ -44,6 +44,7 @@ export class TFolder extends TAbstractFile {
 class MockVault {
   private nodes = new Map<string, TAbstractFile>();
   private contents = new Map<string, string>();
+  private binaryContents = new Map<string, ArrayBuffer>();
   readonly root: TFolder;
 
   constructor() {
@@ -100,12 +101,76 @@ class MockVault {
     file.stat.size = content.length;
   }
 
+  async createBinary(path: string, data: ArrayBuffer): Promise<TFile> {
+    const normalized = normalizePath(path);
+    if (this.nodes.has(normalized)) {
+      throw new Error(`File already exists: ${normalized}`);
+    }
+    const file = new TFile(normalized);
+    file.stat.size = data.byteLength;
+    this.nodes.set(normalized, file);
+    this.binaryContents.set(normalized, data);
+    this.attachToParent(file);
+    return file;
+  }
+
+  async modifyBinary(file: TFile, data: ArrayBuffer): Promise<void> {
+    this.binaryContents.set(file.path, data);
+    file.stat.mtime = Date.now();
+    file.stat.size = data.byteLength;
+  }
+
+  async readBinary(file: TFile): Promise<ArrayBuffer> {
+    const data = this.binaryContents.get(file.path);
+    if (data === undefined) {
+      throw new Error(`No binary content recorded for file: ${file.path}`);
+    }
+    return data;
+  }
+
   async read(file: TFile): Promise<string> {
     const content = this.contents.get(file.path);
     if (content === undefined) {
       throw new Error(`No content recorded for file: ${file.path}`);
     }
     return content;
+  }
+
+  async cachedRead(file: TFile): Promise<string> {
+    return this.read(file);
+  }
+
+  getText(path: string): string | undefined {
+    return this.contents.get(normalizePath(path));
+  }
+
+  async rename(file: TAbstractFile, newPath: string): Promise<void> {
+    const oldPath = file.path;
+    const normalized = normalizePath(newPath);
+    if (this.nodes.has(normalized)) throw new Error(`File already exists: ${normalized}`);
+    const parentPath = this.parentPath(normalized);
+    const parent = this.nodes.get(parentPath);
+    if (!(parent instanceof TFolder)) throw new Error(`Parent folder does not exist: ${parentPath}`);
+
+    if (file.parent) file.parent.children = file.parent.children.filter((child) => child !== file);
+    const content = this.contents.get(oldPath);
+    const binary = this.binaryContents.get(oldPath);
+    this.nodes.delete(oldPath);
+    this.contents.delete(oldPath);
+    this.binaryContents.delete(oldPath);
+
+    file.path = normalized;
+    const parts = normalized.split("/");
+    file.name = parts[parts.length - 1] ?? normalized;
+    if (file instanceof TFile) {
+      const dot = file.name.lastIndexOf(".");
+      file.extension = dot >= 0 ? file.name.slice(dot + 1) : "";
+      file.basename = dot >= 0 ? file.name.slice(0, dot) : file.name;
+    }
+    this.nodes.set(normalized, file);
+    if (content !== undefined) this.contents.set(normalized, content);
+    if (binary !== undefined) this.binaryContents.set(normalized, binary);
+    this.attachToParent(file);
   }
 
   async delete(file: TAbstractFile): Promise<void> {
@@ -121,17 +186,152 @@ class MockVault {
       (n): n is TFile => n instanceof TFile && n.extension === "md"
     );
   }
+
+  getAllLoadedFiles(): TAbstractFile[] {
+    return [...this.nodes.values()];
+  }
+}
+
+interface ParsedMockNote {
+  frontmatter: Record<string, unknown>;
+  body: string;
+  exists: boolean;
+}
+
+function parseScalar(value: string): unknown {
+  const trimmed = value.trim();
+  if (!trimmed) return "";
+  if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
+    const inside = trimmed.slice(1, -1).trim();
+    if (!inside) return [];
+    return inside.split(",").map((part) => parseScalar(part));
+  }
+  if ((trimmed.startsWith("\"") && trimmed.endsWith("\"")) || (trimmed.startsWith("'") && trimmed.endsWith("'"))) {
+    const unquoted = trimmed.slice(1, -1);
+    if (trimmed.startsWith("\"")) {
+      try {
+        return JSON.parse(trimmed) as unknown;
+      } catch {
+        return unquoted;
+      }
+    }
+    return unquoted;
+  }
+  if (trimmed === "true") return true;
+  if (trimmed === "false") return false;
+  if (/^-?\d+(\.\d+)?$/.test(trimmed)) return Number(trimmed);
+  return trimmed;
+}
+
+function parseMockNote(content: string): ParsedMockNote {
+  const lines = content.split(/\r?\n/);
+  if (lines[0] !== "---") return { frontmatter: {}, body: content, exists: false };
+  const end = lines.indexOf("---", 1);
+  if (end < 0) return { frontmatter: {}, body: content, exists: false };
+  const frontmatter: Record<string, unknown> = {};
+  for (let index = 1; index < end; index++) {
+    const match = /^([\w.-]+):\s*(.*)$/.exec(lines[index]);
+    if (!match) continue;
+    const key = match[1];
+    const value = match[2];
+    if (value) {
+      frontmatter[key] = parseScalar(value);
+    } else {
+      const values: unknown[] = [];
+      while (index + 1 < end && /^\s+-\s+/.test(lines[index + 1])) {
+        values.push(parseScalar(lines[index + 1].replace(/^\s+-\s+/, "")));
+        index++;
+      }
+      frontmatter[key] = values;
+    }
+  }
+  const bodyLines = lines.slice(end + 1);
+  if (bodyLines[0] === "") bodyLines.shift();
+  return { frontmatter, body: bodyLines.join("\n"), exists: true };
+}
+
+export function parseYaml(yaml: string): unknown {
+  return parseMockNote(`---\n${yaml}\n---`).frontmatter;
+}
+
+function serializeMockFrontmatter(frontmatter: Record<string, unknown>): string {
+  const lines: string[] = [];
+  for (const [key, value] of Object.entries(frontmatter)) {
+    if (Array.isArray(value)) {
+      if (value.length === 0) lines.push(`${key}: []`);
+      else {
+        lines.push(`${key}:`);
+        for (const item of value) lines.push(`  - ${serializeMockScalar(item)}`);
+      }
+    } else {
+      lines.push(`${key}: ${serializeMockScalar(value)}`);
+    }
+  }
+  return lines.join("\n");
+}
+
+function serializeMockScalar(value: unknown): string {
+  if (typeof value === "string") return JSON.stringify(value);
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  if (value === null) return "null";
+  return JSON.stringify(value);
+}
+
+class MockMetadataCache {
+  constructor(private readonly vault: MockVault) {}
+
+  getFileCache(file: TFile): { frontmatter?: Record<string, unknown>; tags?: { tag: string }[] } | null {
+    const text = this.vault.getText(file.path);
+    if (text === undefined) return null;
+    const parsed = parseMockNote(text);
+    const tags = new Set<string>();
+    const rawFrontmatterTags = parsed.frontmatter.tags;
+    const frontmatterTags = Array.isArray(rawFrontmatterTags)
+      ? rawFrontmatterTags
+      : typeof rawFrontmatterTags === "string"
+        ? rawFrontmatterTags.split(/[\n,]+/)
+        : [];
+    for (const tag of frontmatterTags) {
+      if (typeof tag === "string" && tag.trim()) tags.add(`#${tag.trim().replace(/^#+/, "")}`);
+    }
+    for (const match of parsed.body.matchAll(/#([\p{L}\p{N}_/-]+)/gu)) tags.add(`#${match[1]}`);
+    return { frontmatter: parsed.frontmatter, tags: [...tags].map((tag) => ({ tag })) };
+  }
+}
+
+class MockFileManager {
+  constructor(private readonly vault: MockVault) {}
+
+  async renameFile(file: TAbstractFile, newPath: string): Promise<void> {
+    await this.vault.rename(file, newPath);
+  }
+
+  async processFrontMatter(file: TFile, callback: (frontmatter: Record<string, unknown>) => void): Promise<void> {
+    const content = await this.vault.read(file);
+    const parsed = parseMockNote(content);
+    const frontmatter = { ...parsed.frontmatter };
+    callback(frontmatter);
+    const yaml = serializeMockFrontmatter(frontmatter);
+    const body = parsed.body;
+    await this.vault.modify(file, `---\n${yaml}\n---\n${body ? `\n${body}` : ""}`);
+  }
 }
 
 export class App {
   vault = new MockVault();
   workspace = new MockWorkspace();
-  metadataCache = { getFileCache: () => null };
+  metadataCache = new MockMetadataCache(this.vault);
+  fileManager = new MockFileManager(this.vault);
 }
 
 export class WorkspaceLeaf {
   private viewState: { type: string; active?: boolean } | null = null;
   view: unknown = null;
+  openedFile: TFile | null = null;
+
+  async openFile(file: TFile): Promise<void> {
+    this.openedFile = file;
+  }
 
   async setViewState(state: { type: string; active?: boolean }): Promise<void> {
     this.viewState = state;
@@ -149,10 +349,12 @@ export class WorkspaceLeaf {
 class MockWorkspace {
   private leaves: WorkspaceLeaf[] = [];
   revealedLeaf: WorkspaceLeaf | null = null;
+  lastLeaf: WorkspaceLeaf | null = null;
 
   getLeaf(_newLeaf?: boolean | string): WorkspaceLeaf {
     const leaf = new WorkspaceLeaf();
     this.leaves.push(leaf);
+    this.lastLeaf = leaf;
     return leaf;
   }
 
@@ -170,8 +372,27 @@ class MockWorkspace {
 }
 
 export class Component {
+  private children = new Set<Component>();
+
   onload(): void {}
   onunload(): void {}
+
+  addChild<T extends Component>(component: T): T {
+    this.children.add(component);
+    component.onload();
+    return component;
+  }
+
+  removeChild<T extends Component>(component: T): T {
+    if (this.children.delete(component)) component.onunload();
+    return component;
+  }
+}
+
+export class MarkdownRenderer {
+  static async render(_app: App, markdown: string, el: HTMLElement, _sourcePath: string, _component: Component): Promise<void> {
+    el.textContent = markdown;
+  }
 }
 
 export class Plugin extends Component {

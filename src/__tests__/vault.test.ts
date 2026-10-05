@@ -4,6 +4,7 @@
 import { App } from "obsidian";
 import { VaultManager, toSafeName, timestampSlug } from "../vault";
 import { VaultOperationError } from "../errors";
+import { createSessionStats, recordStage } from "../stats";
 import type { FKMessage, GeneratedFile } from "../types";
 
 describe("toSafeName()", () => {
@@ -13,6 +14,17 @@ describe("toSafeName()", () => {
 
   it("falls back to 'untitled' for an all-unsafe input", () => {
     expect(toSafeName("!!!///???")).toBe("untitled");
+  });
+
+  it("preserves names written in non-Latin scripts", () => {
+    expect(toSafeName("سلام دنیا")).toBe("سلام_دنیا");
+    expect(toSafeName("東京ノート")).toBe("東京ノート");
+  });
+
+  it("truncates by Unicode code point without splitting surrogate pairs", () => {
+    const name = toSafeName("𐐀".repeat(41));
+    expect(Array.from(name)).toHaveLength(40);
+    expect(name).toBe("𐐀".repeat(40));
   });
 
   it("truncates very long names", () => {
@@ -130,5 +142,97 @@ describe("VaultManager", () => {
   it("returns an empty list when the output folder does not exist yet", async () => {
     const { manager } = makeManager("does-not-exist-yet");
     expect(await manager.listProjects()).toEqual([]);
+  });
+
+  it("embeds session stats in the history frontmatter and body when provided", async () => {
+    const { app, manager } = makeManager();
+    const stats = createSessionStats();
+    recordStage(stats, {
+      stage: "architect",
+      provider: "Groq",
+      model: "Llama 3.3 70B",
+      tokens: 1200,
+      durationMs: 2400,
+    });
+
+    const path = await manager.saveChatHistory(
+      "Stats App",
+      [{ id: "1", role: "user", content: "build", timestamp: 1 }],
+      "fullstack",
+      "Groq",
+      stats
+    );
+    const file = app.vault.getAbstractFileByPath(path);
+    const content = await app.vault.read(file as never);
+
+    expect(content).toContain("tokens: 1200");
+    expect(content).toContain("stages: 1");
+    expect(content).toContain("## Session stats");
+    expect(content).toContain("ARCHITECT — 1,200 tok");
+  });
+
+  it("omits the stats frontmatter when no stats were recorded", async () => {
+    const { app, manager } = makeManager();
+    const path = await manager.saveChatHistory(
+      "No Stats",
+      [{ id: "1", role: "user", content: "hi", timestamp: 1 }],
+      "review",
+      ""
+    );
+    const file = app.vault.getAbstractFileByPath(path);
+    const content = await app.vault.read(file as never);
+
+    expect(content).not.toContain("tokens:");
+    expect(content).not.toContain("## Session stats");
+  });
+
+  it("exports generated files as a real ZIP archive under exports/", async () => {
+    const fixedNow = new Date("2026-10-04T12:00:00.000Z");
+    const app = new App();
+    const manager = new VaultManager(app, "fullKONK", () => fixedNow);
+
+    const path = await manager.exportZip("Zip App", [
+      { path: "src/index.ts", content: "export const x = 1;", language: "ts" },
+      { path: "README.md", content: "# Zip App", language: "md" },
+    ]);
+
+    expect(path).toBe("fullKONK/exports/Zip_App-2026-10-04-12-00-00.zip");
+
+    const file = app.vault.getAbstractFileByPath(path);
+    expect(file).not.toBeNull();
+    const bytes = new Uint8Array(await app.vault.readBinary(file as never));
+
+    // Local header signature, EOCD signature, and both file names present.
+    const view = new DataView(bytes.buffer);
+    expect(view.getUint32(0, true)).toBe(0x04034b50);
+    expect(view.getUint32(bytes.length - 22, true)).toBe(0x06054b50);
+    expect(view.getUint16(bytes.length - 12, true)).toBe(2); // entry count
+    const text = new TextDecoder().decode(bytes);
+    expect(text).toContain("src/index.ts");
+    expect(text).toContain("export const x = 1;");
+  });
+
+  it("refuses to export an empty file list as a ZIP or bundle", async () => {
+    const { manager } = makeManager();
+    await expect(manager.exportZip("empty", [])).rejects.toBeInstanceOf(VaultOperationError);
+    await expect(manager.saveBundle("empty", [])).rejects.toBeInstanceOf(VaultOperationError);
+  });
+
+  it("exports a single-file Markdown bundle under exports/", async () => {
+    const fixedNow = new Date("2026-10-04T12:00:00.000Z");
+    const app = new App();
+    const manager = new VaultManager(app, "fullKONK", () => fixedNow);
+
+    const path = await manager.saveBundle("Bundle App", [
+      { path: "src/a.ts", content: "export {};", language: "ts" },
+    ]);
+
+    expect(path).toBe("fullKONK/exports/Bundle_App-2026-10-04-12-00-00.md");
+    const file = app.vault.getAbstractFileByPath(path);
+    const content = await app.vault.read(file as never);
+
+    expect(content).toContain("files: 1");
+    expect(content).toContain("## `src/a.ts`");
+    expect(content).toContain("```ts\nexport {};\n```");
   });
 });
